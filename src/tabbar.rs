@@ -1,0 +1,484 @@
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
+use fontdue::{Font, FontSettings, Metrics};
+use softbuffer::{Context, Surface};
+use winit::window::Window;
+
+pub(crate) const TAB_BAR_HEIGHT_LOGICAL: f64 = 32.0;
+
+const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/CascadiaCode-Regular.ttf");
+
+const COLOR_BACKDROP: u32 = 0x000F1016;
+const COLOR_STRIP_BG: u32 = 0x0016161E;
+const COLOR_TAB_INACTIVE: u32 = 0x001A1B26;
+const COLOR_TAB_HOVER: u32 = 0x00212231;
+const COLOR_TAB_ACTIVE: u32 = 0x001F2335;
+const COLOR_ACCENT: u32 = 0x007AA2F7;
+const COLOR_SEPARATOR: u32 = 0x00232433;
+const COLOR_TEXT: u32 = 0x00C0CAF5;
+const COLOR_TEXT_DIM: u32 = 0x00565F89;
+const COLOR_CLOSE_BG: u32 = 0x002A2E42;
+const COLOR_CLOSE_GLYPH: u32 = 0x00F7768E;
+
+#[derive(Debug)]
+pub(crate) enum Hit {
+    Tab(usize),
+    Close(usize),
+    None,
+}
+
+pub(crate) struct TabModel {
+    pub(crate) guest_index: usize,
+    pub(crate) title: String,
+    pub(crate) active: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Rect {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+struct TabSlot {
+    tab: Rect,
+    close: Rect,
+    guest_index: usize,
+}
+
+pub(crate) struct TabBar {
+    _context: Context<Arc<Window>>,
+    surface: Surface<Arc<Window>, Arc<Window>>,
+    font: Font,
+    font_px: f32,
+    scale: f64,
+    buffer_width: u32,
+    buffer_height: u32,
+    layout: Vec<TabSlot>,
+    hover_tab: Option<usize>,
+    hover_close: Option<usize>,
+    dirty: bool,
+}
+
+fn blend_pixel(background: u32, foreground: u32, coverage: u32) -> u32 {
+    let mut result = 0;
+    for shift in [16, 8, 0] {
+        let fg = (foreground >> shift) & 0xFF;
+        let bg = (background >> shift) & 0xFF;
+        let mixed = (fg * coverage + bg * (255 - coverage) + 127) / 255;
+        result |= mixed << shift;
+    }
+    result
+}
+
+impl TabBar {
+    pub(crate) fn new(window: &Arc<Window>) -> Result<Self, String> {
+        let context =
+            Context::new(Arc::clone(window)).map_err(|error| format!("context: {error}"))?;
+        let surface = Surface::new(&context, Arc::clone(window))
+            .map_err(|error| format!("surface: {error}"))?;
+        let font = Font::from_bytes(
+            FONT_BYTES,
+            FontSettings {
+                collection_index: 0,
+                scale: 40.0,
+                load_substitutions: false,
+            },
+        )
+        .map_err(|error| format!("bundled font could not be parsed: {error:?}"))?;
+        let scale = window.scale_factor();
+
+        Ok(Self {
+            _context: context,
+            surface,
+            font,
+            font_px: Self::font_px_for(scale),
+            scale,
+            buffer_width: 0,
+            buffer_height: 0,
+            layout: Vec::new(),
+            hover_tab: None,
+            hover_close: None,
+            dirty: true,
+        })
+    }
+
+    fn font_px_for(scale: f64) -> f32 {
+        ((14.0 * scale) as f32).round().clamp(11.0, 26.0)
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub(crate) fn update_scale(&mut self, scale: f64) {
+        if (scale - self.scale).abs() > f64::EPSILON {
+            self.scale = scale;
+            self.font_px = Self::font_px_for(scale);
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn set_hover(&mut self, hit: Hit) {
+        let (tab, close) = match hit {
+            Hit::Tab(index) => (Some(index), None),
+            Hit::Close(index) => (None, Some(index)),
+            Hit::None => (None, None),
+        };
+
+        if tab != self.hover_tab || close != self.hover_close {
+            self.hover_tab = tab;
+            self.hover_close = close;
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn clear_hover(&mut self) {
+        self.set_hover(Hit::None);
+    }
+
+    pub(crate) fn hit_test(&self, x: i32, y: i32) -> Hit {
+        for slot in &self.layout {
+            if slot.close.contains(x, y) {
+                return Hit::Close(slot.guest_index);
+            }
+            if slot.tab.contains(x, y) {
+                return Hit::Tab(slot.guest_index);
+            }
+        }
+
+        Hit::None
+    }
+
+    pub(crate) fn draw(&mut self, window: &Window, tabs: &[TabModel]) {
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+
+        if width != self.buffer_width || height != self.buffer_height {
+            let resize = self.surface.resize(
+                NonZeroU32::new(width).expect("width is nonzero"),
+                NonZeroU32::new(height).expect("height is nonzero"),
+            );
+            if let Err(error) = resize {
+                eprintln!("Could not resize the tab bar surface: {error}");
+                return;
+            }
+            self.buffer_width = width;
+            self.buffer_height = height;
+        }
+
+        let Ok(mut buffer) = self.surface.buffer_mut() else {
+            return;
+        };
+
+        let pixels: &mut [u32] = &mut buffer;
+        let stride = width as i32;
+        let canvas_height = height as i32;
+        pixels.fill(COLOR_BACKDROP);
+
+        let strip_height =
+            ((TAB_BAR_HEIGHT_LOGICAL * self.scale).round() as i32).min(canvas_height);
+        for y in 0..strip_height {
+            let row_start = (y * stride) as usize;
+            let row = &mut pixels[row_start..row_start + stride as usize];
+            row.fill(COLOR_STRIP_BG);
+        }
+
+        self.layout.clear();
+
+        let scaled = |value: f64| -> i32 { (value * self.scale).round() as i32 };
+        let padding = scaled(6.0);
+        let gap = scaled(4.0);
+        let inset_y = scaled(4.0);
+        let min_tab_width = scaled(90.0);
+        let max_tab_width = scaled(220.0);
+
+        let line_metrics = self.font.horizontal_line_metrics(self.font_px);
+        let (ascent, descent) = match line_metrics {
+            Some(metrics) => (metrics.ascent, metrics.descent),
+            None => (self.font_px * 0.8, self.font_px * 0.2),
+        };
+
+        let count = tabs.len() as i32;
+        if count > 0 && strip_height > inset_y * 2 {
+            let tab_height = strip_height - inset_y * 2;
+            let available = stride - padding * 2 - gap * (count - 1);
+            let tab_width = if available >= count * min_tab_width {
+                (available / count).min(max_tab_width)
+            } else {
+                min_tab_width
+            };
+
+            for (slot, model) in tabs.iter().enumerate() {
+                let tab_x = padding + slot as i32 * (tab_width + gap);
+                let tab_rect = Rect {
+                    x: tab_x,
+                    y: inset_y,
+                    w: tab_width,
+                    h: tab_height,
+                };
+                let close_side = (tab_height - 2 * scaled(7.0)).max(scaled(10.0));
+                let close_rect = Rect {
+                    x: tab_x + tab_width - close_side - scaled(6.0),
+                    y: inset_y + (tab_height - close_side) / 2,
+                    w: close_side,
+                    h: close_side,
+                };
+
+                let hovered = self.hover_tab == Some(model.guest_index);
+                let background = if model.active {
+                    COLOR_TAB_ACTIVE
+                } else if hovered {
+                    COLOR_TAB_HOVER
+                } else {
+                    COLOR_TAB_INACTIVE
+                };
+                Self::fill_rect(pixels, stride, canvas_height, tab_rect, background);
+
+                if model.active {
+                    let accent_height = scaled(2.0).max(2);
+                    Self::fill_rect(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        Rect {
+                            x: tab_rect.x,
+                            y: tab_rect.y + tab_rect.h - accent_height,
+                            w: tab_rect.w,
+                            h: accent_height,
+                        },
+                        COLOR_ACCENT,
+                    );
+                }
+
+                if slot > 0 {
+                    let separator_x = tab_rect.x - ((gap + 1) / 2).max(1);
+                    Self::fill_rect(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        Rect {
+                            x: separator_x,
+                            y: inset_y + scaled(3.0),
+                            w: 1,
+                            h: tab_height - scaled(6.0),
+                        },
+                        COLOR_SEPARATOR,
+                    );
+                }
+
+                let text_color = if model.active || hovered {
+                    COLOR_TEXT
+                } else {
+                    COLOR_TEXT_DIM
+                };
+                let baseline =
+                    inset_y as f32 + (tab_height as f32 - (ascent - descent)) / 2.0 + ascent;
+                Self::draw_text(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    &self.font,
+                    self.font_px,
+                    &model.title,
+                    tab_rect.x + scaled(12.0),
+                    baseline.round() as i32,
+                    close_rect.x - scaled(8.0),
+                    text_color,
+                );
+
+                if self.hover_close == Some(model.guest_index) {
+                    Self::fill_rect(pixels, stride, canvas_height, close_rect, COLOR_CLOSE_BG);
+                }
+                let glyph_color = if self.hover_close == Some(model.guest_index) {
+                    COLOR_CLOSE_GLYPH
+                } else {
+                    COLOR_TEXT_DIM
+                };
+                let glyph_inset = (close_rect.w as f32 * 0.3).round() as i32;
+                let (lx0, ly0) = (close_rect.x + glyph_inset, close_rect.y + glyph_inset);
+                let (lx1, ly1) = (
+                    close_rect.x + close_rect.w - glyph_inset - 1,
+                    close_rect.y + close_rect.h - glyph_inset - 1,
+                );
+                Self::draw_line(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    lx0,
+                    ly0,
+                    lx1,
+                    ly1,
+                    glyph_color,
+                );
+                Self::draw_line(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    lx0,
+                    ly1,
+                    lx1,
+                    ly0,
+                    glyph_color,
+                );
+
+                self.layout.push(TabSlot {
+                    tab: tab_rect,
+                    close: close_rect,
+                    guest_index: model.guest_index,
+                });
+            }
+        }
+
+        if let Err(error) = buffer.present() {
+            eprintln!("Could not present the tab bar frame: {error}");
+            self.dirty = true;
+        }
+    }
+
+    fn fill_rect(pixels: &mut [u32], stride: i32, height: i32, rect: Rect, color: u32) {
+        let x0 = rect.x.max(0);
+        let y0 = rect.y.max(0);
+        let x1 = (rect.x + rect.w).min(stride);
+        let y1 = (rect.y + rect.h).min(height);
+
+        for y in y0..y1 {
+            let row_start = (y * stride) as usize;
+            let row = &mut pixels[row_start..row_start + stride as usize];
+            row[x0 as usize..x1 as usize].fill(color);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(
+        pixels: &mut [u32],
+        stride: i32,
+        height: i32,
+        font: &Font,
+        font_px: f32,
+        text: &str,
+        start_x: i32,
+        baseline: i32,
+        max_x: i32,
+        color: u32,
+    ) {
+        let mut pen = start_x as f32;
+
+        for character in text.chars() {
+            let glyph_index = font.lookup_glyph_index(character);
+            let (metrics, bitmap) = font.rasterize_indexed(glyph_index, font_px);
+
+            let advance = metrics.advance_width;
+            if pen + advance > max_x as f32 {
+                let (ellipsis_metrics, ellipsis_bitmap) = font.rasterize('…', font_px);
+                if pen + ellipsis_metrics.advance_width <= max_x as f32 {
+                    Self::blit_glyph(
+                        pixels,
+                        stride,
+                        height,
+                        &ellipsis_bitmap,
+                        &ellipsis_metrics,
+                        pen.round() as i32,
+                        baseline,
+                        color,
+                    );
+                }
+                break;
+            }
+
+            Self::blit_glyph(
+                pixels,
+                stride,
+                height,
+                &bitmap,
+                &metrics,
+                pen.round() as i32,
+                baseline,
+                color,
+            );
+            pen += advance;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_glyph(
+        pixels: &mut [u32],
+        stride: i32,
+        height: i32,
+        bitmap: &[u8],
+        metrics: &Metrics,
+        pen_x: i32,
+        baseline: i32,
+        color: u32,
+    ) {
+        if metrics.width == 0 || metrics.height == 0 {
+            return;
+        }
+
+        let left = pen_x + metrics.xmin;
+        let top = baseline - metrics.ymin - metrics.height as i32;
+
+        for row in 0..metrics.height {
+            let y = top + row as i32;
+            if y < 0 || y >= height {
+                continue;
+            }
+
+            for col in 0..metrics.width {
+                let coverage = bitmap[row * metrics.width + col] as u32;
+                if coverage == 0 {
+                    continue;
+                }
+
+                let x = left + col as i32;
+                if x < 0 || x >= stride {
+                    continue;
+                }
+
+                let index = (y * stride + x) as usize;
+                pixels[index] = blend_pixel(pixels[index], color, coverage);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_line(
+        pixels: &mut [u32],
+        stride: i32,
+        height: i32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: u32,
+    ) {
+        let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+
+        for t in 0..=steps {
+            let x = x0 + (x1 - x0) * t / steps;
+            let y = y0 + (y1 - y0) * t / steps;
+            if x < 0 || x >= stride || y < 0 || y >= height {
+                continue;
+            }
+
+            pixels[(y * stride + x) as usize] = color;
+        }
+    }
+}
