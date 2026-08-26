@@ -390,12 +390,6 @@ impl App {
         }
 
         if let Some(managed) = self.managed_windows.get_mut(index) {
-            if let Err(error) = managed.restore_native_state() {
-                eprintln!(
-                    "Could not restore {} before closing: {error}",
-                    managed.title
-                );
-            }
             managed.close();
         }
         self.mark_dirty();

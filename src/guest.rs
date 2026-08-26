@@ -291,10 +291,13 @@ impl ManagedWindow {
         }
     }
 
-    pub(crate) fn close(&self) {
+    pub(crate) fn close(&mut self) {
         if !self.is_open() {
             return;
         }
+
+        self.hide();
+        self.managed_mode = false;
 
         unsafe {
             if let Err(error) = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) {
