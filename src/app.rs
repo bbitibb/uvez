@@ -182,11 +182,6 @@ impl App {
         }
     }
 
-    fn host_is_foreground(&self) -> bool {
-        self.host_hwnd()
-            .is_some_and(|host| unsafe { GetForegroundWindow() == host })
-    }
-
     fn group_is_foreground(&self) -> bool {
         let foreground = unsafe { GetForegroundWindow() };
 
@@ -599,7 +594,8 @@ impl App {
                 continue;
             }
 
-            let title = guest::get_window_title(managed.hwnd);
+            let raw_title = guest::get_window_title(managed.hwnd);
+            let title = guest::format_title(&raw_title, &managed.exe_name);
             if !title.is_empty() && title != managed.title {
                 managed.title = title;
                 titles_changed = true;
@@ -712,18 +708,18 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Moved(_) => {
-                let host_is_foreground = self.host_is_foreground();
+                let group_is_foreground = self.group_is_foreground();
                 self.sync_group_bounds();
-                self.refocus_pending = host_is_foreground;
+                self.refocus_pending = group_is_foreground;
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.update_scale(scale_factor);
                 }
-                let host_is_foreground = self.host_is_foreground();
+                let group_is_foreground = self.group_is_foreground();
                 self.sync_group_bounds();
-                self.refocus_pending = host_is_foreground;
+                self.refocus_pending = group_is_foreground;
             }
 
             WindowEvent::Resized(size) => {
@@ -736,9 +732,9 @@ impl ApplicationHandler for App {
                     self.bounds_dirty = false;
                     self.refocus_pending = false;
                 } else {
-                    let host_is_foreground = self.host_is_foreground();
+                    let group_is_foreground = self.group_is_foreground();
                     self.sync_group_bounds();
-                    self.refocus_pending = host_is_foreground;
+                    self.refocus_pending = group_is_foreground;
                 }
             }
 
