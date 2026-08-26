@@ -25,6 +25,7 @@ const COLOR_CLOSE_GLYPH: u32 = 0x00F7768E;
 pub(crate) enum Hit {
     Tab(usize),
     Close(usize),
+    NewTab,
     None,
 }
 
@@ -63,8 +64,10 @@ pub(crate) struct TabBar {
     buffer_width: u32,
     buffer_height: u32,
     layout: Vec<TabSlot>,
+    new_tab_slot: Option<Rect>,
     hover_tab: Option<usize>,
     hover_close: Option<usize>,
+    hover_new_tab: bool,
     dirty: bool,
 }
 
@@ -105,8 +108,10 @@ impl TabBar {
             buffer_width: 0,
             buffer_height: 0,
             layout: Vec::new(),
+            new_tab_slot: None,
             hover_tab: None,
             hover_close: None,
+            hover_new_tab: false,
             dirty: true,
         })
     }
@@ -132,15 +137,17 @@ impl TabBar {
     }
 
     pub(crate) fn set_hover(&mut self, hit: Hit) {
-        let (tab, close) = match hit {
-            Hit::Tab(index) => (Some(index), None),
-            Hit::Close(index) => (None, Some(index)),
-            Hit::None => (None, None),
+        let (tab, close, new_tab) = match hit {
+            Hit::Tab(index) => (Some(index), None, false),
+            Hit::Close(index) => (None, Some(index), false),
+            Hit::NewTab => (None, None, true),
+            Hit::None => (None, None, false),
         };
 
-        if tab != self.hover_tab || close != self.hover_close {
+        if tab != self.hover_tab || close != self.hover_close || new_tab != self.hover_new_tab {
             self.hover_tab = tab;
             self.hover_close = close;
+            self.hover_new_tab = new_tab;
             self.dirty = true;
         }
     }
@@ -150,6 +157,12 @@ impl TabBar {
     }
 
     pub(crate) fn hit_test(&self, x: i32, y: i32) -> Hit {
+        if let Some(new_tab) = self.new_tab_slot
+            && new_tab.contains(x, y)
+        {
+            return Hit::NewTab;
+        }
+
         for slot in &self.layout {
             if slot.close.contains(x, y) {
                 return Hit::Close(slot.guest_index);
@@ -202,6 +215,7 @@ impl TabBar {
         }
 
         self.layout.clear();
+        self.new_tab_slot = None;
 
         let scaled = |value: f64| -> i32 { (value * self.scale).round() as i32 };
         let padding = scaled(6.0);
@@ -217,17 +231,22 @@ impl TabBar {
         };
 
         let count = tabs.len() as i32;
-        if count > 0 && strip_height > inset_y * 2 {
+        if strip_height > inset_y * 2 {
             let tab_height = strip_height - inset_y * 2;
-            let available = stride - padding * 2 - gap * (count - 1);
-            let tab_width = if available >= count * min_tab_width {
+            let new_tab_size = tab_height;
+            let button_space = new_tab_size + gap;
+            let available = (stride - padding * 2 - button_space - gap * (count - 1)).max(0);
+            let tab_width = if count > 0 && available >= count * min_tab_width {
                 (available / count).min(max_tab_width)
             } else {
                 min_tab_width
             };
 
+            let mut current_x = padding;
+
             for (slot, model) in tabs.iter().enumerate() {
                 let tab_x = padding + slot as i32 * (tab_width + gap);
+                current_x = tab_x + tab_width + gap;
                 let tab_rect = Rect {
                     x: tab_x,
                     y: inset_y,
@@ -344,6 +363,52 @@ impl TabBar {
                     close: close_rect,
                     guest_index: model.guest_index,
                 });
+            }
+
+            if current_x + new_tab_size <= stride - padding {
+                let new_tab_rect = Rect {
+                    x: current_x,
+                    y: inset_y,
+                    w: new_tab_size,
+                    h: tab_height,
+                };
+                self.new_tab_slot = Some(new_tab_rect);
+
+                let bg = if self.hover_new_tab {
+                    COLOR_TAB_HOVER
+                } else {
+                    COLOR_TAB_INACTIVE
+                };
+                Self::fill_rect(pixels, stride, canvas_height, new_tab_rect, bg);
+
+                let glyph_color = if self.hover_new_tab {
+                    COLOR_TEXT
+                } else {
+                    COLOR_TEXT_DIM
+                };
+                let cx = new_tab_rect.x + new_tab_rect.w / 2;
+                let cy = new_tab_rect.y + new_tab_rect.h / 2;
+                let arm = scaled(4.0).max(3);
+                Self::draw_line(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    cx - arm,
+                    cy,
+                    cx + arm,
+                    cy,
+                    glyph_color,
+                );
+                Self::draw_line(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    cx,
+                    cy - arm,
+                    cx,
+                    cy + arm,
+                    glyph_color,
+                );
             }
         }
 

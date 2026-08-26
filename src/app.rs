@@ -12,7 +12,7 @@ use crate::host_events::{
 use crate::tabbar::{Hit, TAB_BAR_HEIGHT_LOGICAL, TabBar, TabModel};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_TAB,
+    MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_T, VK_TAB,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -25,6 +25,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
+pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct App {
@@ -35,6 +36,7 @@ pub(crate) struct App {
     bounds_dirty: bool,
     refocus_pending: bool,
     switch_requested: Arc<AtomicBool>,
+    new_tab_requested: Arc<AtomicBool>,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
@@ -45,7 +47,10 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(switch_requested: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        switch_requested: Arc<AtomicBool>,
+        new_tab_requested: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             window: None,
             managed_windows: Vec::new(),
@@ -54,6 +59,7 @@ impl App {
             bounds_dirty: false,
             refocus_pending: false,
             switch_requested,
+            new_tab_requested,
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
@@ -442,8 +448,24 @@ impl App {
         }
     }
 
-    fn register_switch_hotkey(&mut self) {
-        let result = unsafe {
+    fn spawn_new_tab(&mut self) {
+        match create_managed_window("alacritty.exe", &[]) {
+            Ok(managed) => {
+                if let Err(error) = self.add_managed_window(managed) {
+                    eprintln!("Could not manage new window: {error}");
+                    return;
+                }
+                let new_index = self.managed_windows.len().saturating_sub(1);
+                self.activate_window(new_index);
+            }
+            Err(error) => {
+                eprintln!("Could not create new window: {error}");
+            }
+        }
+    }
+
+    fn register_hotkeys(&mut self) {
+        let switch_res = unsafe {
             RegisterHotKey(
                 None,
                 SWITCH_HOTKEY_ID,
@@ -451,23 +473,37 @@ impl App {
                 u32::from(VK_TAB.0),
             )
         };
-
-        match result {
-            Ok(()) => {
-                self.hotkey_registered = true;
-                println!("Press Ctrl+Tab to switch to the most recently used tab");
-            }
+        match switch_res {
+            Ok(()) => println!("Press Ctrl+Tab to switch to the most recently used tab"),
             Err(error) => eprintln!("Could not register Ctrl+Tab: {error}"),
         }
+
+        let new_tab_res = unsafe {
+            RegisterHotKey(
+                None,
+                NEW_TAB_HOTKEY_ID,
+                MOD_CONTROL | MOD_NOREPEAT,
+                u32::from(VK_T.0),
+            )
+        };
+        match new_tab_res {
+            Ok(()) => println!("Press Ctrl+T to open a new tab"),
+            Err(error) => eprintln!("Could not register Ctrl+T: {error}"),
+        }
+
+        self.hotkey_registered = true;
     }
 
-    fn unregister_switch_hotkey(&mut self) {
+    fn unregister_hotkeys(&mut self) {
         if !self.hotkey_registered {
             return;
         }
 
         if let Err(error) = unsafe { UnregisterHotKey(None, SWITCH_HOTKEY_ID) } {
             eprintln!("Could not unregister Ctrl+Tab: {error}");
+        }
+        if let Err(error) = unsafe { UnregisterHotKey(None, NEW_TAB_HOTKEY_ID) } {
+            eprintln!("Could not unregister Ctrl+T: {error}");
         }
         self.hotkey_registered = false;
     }
@@ -529,6 +565,9 @@ impl App {
         println!("Strip click {button:?} at ({x}, {y}): {hit:?}");
 
         match (button, hit) {
+            (MouseButton::Left, Hit::NewTab) => {
+                self.spawn_new_tab();
+            }
             (MouseButton::Left, Hit::Tab(guest_index)) => {
                 if !self
                     .managed_windows
@@ -692,7 +731,7 @@ impl ApplicationHandler for App {
             }
         }
 
-        self.register_switch_hotkey();
+        self.register_hotkeys();
         self.activate_window(0);
     }
 
@@ -811,6 +850,10 @@ impl ApplicationHandler for App {
             self.activate_next_window();
         }
 
+        if self.new_tab_requested.swap(false, Ordering::AcqRel) {
+            self.spawn_new_tab();
+        }
+
         if self.last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
             self.housekeeping();
         }
@@ -841,7 +884,7 @@ impl ApplicationHandler for App {
             .active_pid
             .store(0, Ordering::Release);
         self.release_managed_windows();
-        self.unregister_switch_hotkey();
+        self.unregister_hotkeys();
         self.remove_host_subclass();
     }
 }

@@ -22,6 +22,7 @@ Instead of relying on terminal-specific tab implementations or tiling window man
 
 | Action | Input |
 |---|---|
+| **New tab** | `Ctrl + T` or `Left Click` on `+` |
 | **Switch to recent tab (MRU)** | `Ctrl + Tab` |
 | **Switch tab** | `Left Click` on tab |
 | **Close tab** | `Middle Click` on tab or `Left Click` on `×` |
