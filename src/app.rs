@@ -12,7 +12,7 @@ use crate::host_events::{
 use crate::tabbar::{Hit, TAB_BAR_HEIGHT_LOGICAL, TabBar, TabModel};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_U,
+    MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_TAB,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -31,6 +31,7 @@ pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
     active: Option<usize>,
+    mru: Vec<usize>,
     bounds_dirty: bool,
     refocus_pending: bool,
     switch_requested: Arc<AtomicBool>,
@@ -49,6 +50,7 @@ impl App {
             window: None,
             managed_windows: Vec::new(),
             active: None,
+            mru: Vec::new(),
             bounds_dirty: false,
             refocus_pending: false,
             switch_requested,
@@ -60,6 +62,13 @@ impl App {
             cursor_pos: None,
             last_housekeeping: Instant::now(),
         }
+    }
+
+    fn touch_mru(&mut self, index: usize) {
+        if let Some(position) = self.mru.iter().position(|existing| *existing == index) {
+            let _ = self.mru.remove(position);
+        }
+        self.mru.insert(0, index);
     }
 
     fn mark_dirty(&mut self) {
@@ -318,6 +327,7 @@ impl App {
         }
 
         self.active = Some(index);
+        self.touch_mru(index);
         self.native_host_events
             .active_pid
             .store(self.managed_windows[index].pid, Ordering::Release);
@@ -355,17 +365,29 @@ impl App {
             return;
         }
 
-        let first_candidate = self
-            .active
-            .map(|active| (active + 1) % self.managed_windows.len())
-            .unwrap_or(0);
+        let mut candidates: Vec<usize> = self
+            .mru
+            .iter()
+            .copied()
+            .filter(|index| {
+                *index < self.managed_windows.len() && self.managed_windows[*index].is_open()
+            })
+            .collect();
 
-        for offset in 0..self.managed_windows.len() {
-            let candidate = (first_candidate + offset) % self.managed_windows.len();
-            if self.managed_windows[candidate].is_open() {
-                self.activate_window(candidate);
-                return;
+        for (index, managed) in self.managed_windows.iter().enumerate() {
+            if managed.is_open() && !candidates.contains(&index) {
+                candidates.push(index);
             }
+        }
+
+        if let Some(&active) = self.active.as_ref()
+            && let Some(position) = candidates.iter().position(|index| *index == active)
+        {
+            let _ = candidates.remove(position);
+        }
+
+        if let Some(next) = candidates.into_iter().next() {
+            self.activate_window(next);
         }
     }
 
@@ -425,17 +447,17 @@ impl App {
             RegisterHotKey(
                 None,
                 SWITCH_HOTKEY_ID,
-                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-                u32::from(VK_U.0),
+                MOD_CONTROL | MOD_NOREPEAT,
+                u32::from(VK_TAB.0),
             )
         };
 
         match result {
             Ok(()) => {
                 self.hotkey_registered = true;
-                println!("Press Ctrl+Alt+U to switch the active managed window");
+                println!("Press Ctrl+Tab to switch to the most recently used tab");
             }
-            Err(error) => eprintln!("Could not register Ctrl+Alt+U: {error}"),
+            Err(error) => eprintln!("Could not register Ctrl+Tab: {error}"),
         }
     }
 
@@ -445,7 +467,7 @@ impl App {
         }
 
         if let Err(error) = unsafe { UnregisterHotKey(None, SWITCH_HOTKEY_ID) } {
-            eprintln!("Could not unregister Ctrl+Alt+U: {error}");
+            eprintln!("Could not unregister Ctrl+Tab: {error}");
         }
         self.hotkey_registered = false;
     }
@@ -580,6 +602,13 @@ impl App {
                     .store(0, Ordering::Release);
             }
         }
+
+        self.mru.retain(|index| *index < self.managed_windows.len());
+        self.mru = self
+            .mru
+            .iter()
+            .map(|index| new_index_of_old[*index])
+            .collect();
 
         self.mark_dirty();
         true
