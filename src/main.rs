@@ -26,6 +26,9 @@ fn main() -> WinResult<()> {
     let new_tab_requested = Arc::new(AtomicU32::new(0));
     let hook_new_tab_requested = Arc::clone(&new_tab_requested);
 
+    let close_tab_requested = Arc::new(AtomicU32::new(0));
+    let hook_close_tab_requested = Arc::clone(&close_tab_requested);
+
     let mut event_loop_builder = EventLoop::builder();
     event_loop_builder.with_msg_hook(move |message| {
         let message = unsafe { &*message.cast::<MSG>() };
@@ -38,12 +41,16 @@ fn main() -> WinResult<()> {
                 hook_new_tab_requested.fetch_add(1, Ordering::Release);
                 return true;
             }
+            if message.wParam.0 == app::CLOSE_TAB_HOTKEY_ID as usize {
+                hook_close_tab_requested.fetch_add(1, Ordering::Release);
+                return true;
+            }
         }
         false
     });
 
     let event_loop = event_loop_builder.build().unwrap();
-    let mut app = App::new(switch_requested, new_tab_requested);
+    let mut app = App::new(switch_requested, new_tab_requested, close_tab_requested);
     event_loop.run_app(&mut app).unwrap();
 
     if app.take_fatal_error().is_some() {

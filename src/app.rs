@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetDoubleClickTime, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
-    UnregisterHotKey, VK_CONTROL, VK_T, VK_TAB,
+    GetAsyncKeyState, GetDoubleClickTime, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey,
+    UnregisterHotKey, VK_CONTROL, VK_T, VK_TAB, VK_W,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -37,6 +37,7 @@ use winit::window::{Window, WindowId};
 
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
 pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
+pub(crate) const CLOSE_TAB_HOTKEY_ID: i32 = 3;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
@@ -100,11 +101,13 @@ pub(crate) struct App {
     fatal_error: Option<String>,
     switch_requested: Arc<AtomicU32>,
     new_tab_requested: Arc<AtomicU32>,
+    close_tab_requested: Arc<AtomicU32>,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
     hotkey_switch_registered: bool,
     hotkey_new_tab_registered: bool,
+    hotkey_close_tab_registered: bool,
     arrival_tx: mpsc::Sender<guest::ManagedWindowArrival>,
     arrival_rx: mpsc::Receiver<guest::ManagedWindowArrival>,
     startup_spawns_pending: usize,
@@ -116,7 +119,11 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(switch_requested: Arc<AtomicU32>, new_tab_requested: Arc<AtomicU32>) -> Self {
+    pub(crate) fn new(
+        switch_requested: Arc<AtomicU32>,
+        new_tab_requested: Arc<AtomicU32>,
+        close_tab_requested: Arc<AtomicU32>,
+    ) -> Self {
         let (arrival_tx, arrival_rx) = mpsc::channel();
 
         Self {
@@ -130,11 +137,13 @@ impl App {
             fatal_error: None,
             switch_requested,
             new_tab_requested,
+            close_tab_requested,
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
             hotkey_switch_registered: false,
             hotkey_new_tab_registered: false,
+            hotkey_close_tab_registered: false,
             arrival_tx,
             arrival_rx,
             startup_spawns_pending: 0,
@@ -589,6 +598,22 @@ impl App {
         self.mark_dirty();
     }
 
+    fn close_active_window(&mut self) {
+        let Some(active) = self.active else {
+            return;
+        };
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return;
+        }
+
+        self.close_managed_window(active);
+        self.activate_next_window();
+    }
+
     fn close_all_managed_windows(&mut self) {
         for index in 0..self.managed_windows.len() {
             self.close_managed_window(index);
@@ -705,6 +730,20 @@ impl App {
             } {
                 Ok(()) => self.hotkey_new_tab_registered = true,
                 Err(error) => eprintln!("Could not register Ctrl+T: {error}"),
+            }
+        }
+
+        if !self.hotkey_close_tab_registered {
+            match unsafe {
+                RegisterHotKey(
+                    None,
+                    CLOSE_TAB_HOTKEY_ID,
+                    MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+                    u32::from(VK_W.0),
+                )
+            } {
+                Ok(()) => self.hotkey_close_tab_registered = true,
+                Err(error) => eprintln!("Could not register Ctrl + W: {error}"),
             }
         }
     }
@@ -1188,6 +1227,16 @@ impl ApplicationHandler for App {
             .is_ok()
         {
             self.spawn_new_tab();
+        }
+
+        while self
+            .close_tab_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.close_active_window();
         }
 
         if self.last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
