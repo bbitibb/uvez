@@ -628,7 +628,8 @@ impl App {
     }
 
     fn spawn_new_tab(&mut self) {
-        guest::request_managed_window("alacritty.exe", &[], self.arrival_tx.clone());
+        let host_hwnd = self.host_hwnd().map(|hwnd| hwnd.0 as isize);
+        guest::request_managed_window("alacritty.exe", &[], self.arrival_tx.clone(), host_hwnd);
     }
 
     fn register_hotkeys(&mut self) {

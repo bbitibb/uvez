@@ -15,10 +15,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible,
     PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT, WM_CLOSE,
-    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-    WS_THICKFRAME,
+    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT, WM_APP,
+    WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows::core::{BOOL, Result as WinResult};
 
@@ -541,12 +541,25 @@ pub(crate) fn request_managed_window(
     process_name: &str,
     args: &[&str],
     sender: mpsc::Sender<ManagedWindowArrival>,
+    host_hwnd: Option<isize>,
 ) {
     let process_name = process_name.to_string();
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
 
     thread::spawn(move || {
-        let _ = sender.send(discover_managed_window(&process_name, &args));
+        let arrival = discover_managed_window(&process_name, &args);
+        let _ = sender.send(arrival);
+
+        if let Some(hwnd) = host_hwnd {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_APP,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
     });
 }
 
@@ -576,6 +589,13 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
                 })?;
             }
 
+            let originally_visible = unsafe { IsWindowVisible(info.hwnd).as_bool() };
+            if originally_visible {
+                unsafe {
+                    let _ = ShowWindow(info.hwnd, SW_HIDE);
+                }
+            }
+
             return Ok(DiscoveredWindow {
                 hwnd: info.hwnd.0 as isize,
                 pid,
@@ -585,11 +605,11 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
                 original_ex_style,
                 original_rect,
                 original_placement,
-                originally_visible: unsafe { IsWindowVisible(info.hwnd).as_bool() },
+                originally_visible,
             });
         }
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(15));
     }
 
     Err(format!(
