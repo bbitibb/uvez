@@ -18,8 +18,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    GetForegroundWindow, HWND_TOP, MB_ICONERROR, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetWindowPos,
 };
+use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
@@ -37,6 +39,20 @@ struct CycleSession {
     step: usize,
 }
 
+fn show_error_box(message: &str) {
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from("Uvez");
+
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_ICONERROR,
+        );
+    }
+}
+
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
@@ -45,6 +61,7 @@ pub(crate) struct App {
     cycle: Option<CycleSession>,
     bounds_dirty: bool,
     refocus_pending: bool,
+    fatal_error: Option<String>,
     switch_requested: Arc<AtomicU32>,
     new_tab_requested: Arc<AtomicU32>,
     native_host_events: Arc<NativeHostEvents>,
@@ -72,6 +89,7 @@ impl App {
             cycle: None,
             bounds_dirty: false,
             refocus_pending: false,
+            fatal_error: None,
             switch_requested,
             new_tab_requested,
             native_host_events: Arc::new(NativeHostEvents::default()),
@@ -571,6 +589,9 @@ impl App {
                     Err(error) => {
                         eprintln!("Could not manage new window: {error}");
                         if startup && self.active.is_none() {
+                            self.fail_startup(format!(
+                                "Uvez could not manage the new window: {error}"
+                            ));
                             self.reveal_managed_windows();
                             event_loop.exit();
                         }
@@ -585,11 +606,25 @@ impl App {
             Err(error) => {
                 eprintln!("Could not create managed window: {error}");
                 if startup && self.active.is_none() {
+                    self.fail_startup(format!(
+                        "Could not start the guest application: {error}\n\nMake sure Alacritty is installed and available on PATH, then start Uvez again."
+                    ));
                     self.reveal_managed_windows();
                     event_loop.exit();
                 }
             }
         }
+    }
+
+    fn fail_startup(&mut self, message: String) {
+        if self.fatal_error.is_none() {
+            show_error_box(&message);
+            self.fatal_error = Some(message);
+        }
+    }
+
+    pub(crate) fn take_fatal_error(&mut self) -> Option<String> {
+        self.fatal_error.take()
     }
 
     fn spawn_new_tab(&mut self) {
@@ -851,6 +886,9 @@ impl ApplicationHandler for App {
 
         if let Err(error) = self.install_host_subclass() {
             eprintln!("Could not initialize native host synchronization: {error}");
+            self.fail_startup(format!(
+                "Uvez could not initialize native host synchronization: {error}"
+            ));
             event_loop.exit();
             return;
         }
@@ -859,6 +897,9 @@ impl ApplicationHandler for App {
             Ok(tab_bar) => self.tab_bar = Some(tab_bar),
             Err(error) => {
                 eprintln!("Could not initialize the tab bar renderer: {error}");
+                self.fail_startup(format!(
+                    "Uvez could not initialize the tab bar renderer: {error}"
+                ));
                 self.reveal_managed_windows();
                 event_loop.exit();
                 return;

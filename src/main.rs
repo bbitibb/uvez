@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod guest;
 mod host_events;
@@ -43,6 +45,10 @@ fn main() -> WinResult<()> {
     let event_loop = event_loop_builder.build().unwrap();
     let mut app = App::new(switch_requested, new_tab_requested);
     event_loop.run_app(&mut app).unwrap();
+
+    if app.take_fatal_error().is_some() {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
