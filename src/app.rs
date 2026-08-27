@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,8 @@ use crate::host_events::{
 use crate::tabbar::{Hit, TAB_BAR_HEIGHT_LOGICAL, TabBar, TabModel};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_T, VK_TAB,
+    GetAsyncKeyState, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_CONTROL,
+    VK_T, VK_TAB,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -20,23 +21,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
 pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
+const KEY_PRESSED: u16 = 0x8000;
+
+struct CycleSession {
+    order: Vec<usize>,
+    step: usize,
+}
 
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
     active: Option<usize>,
     mru: Vec<usize>,
+    cycle: Option<CycleSession>,
     bounds_dirty: bool,
     refocus_pending: bool,
-    switch_requested: Arc<AtomicBool>,
-    new_tab_requested: Arc<AtomicBool>,
+    switch_requested: Arc<AtomicU32>,
+    new_tab_requested: Arc<AtomicU32>,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
@@ -47,15 +55,13 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(
-        switch_requested: Arc<AtomicBool>,
-        new_tab_requested: Arc<AtomicBool>,
-    ) -> Self {
+    pub(crate) fn new(switch_requested: Arc<AtomicU32>, new_tab_requested: Arc<AtomicU32>) -> Self {
         Self {
             window: None,
             managed_windows: Vec::new(),
             active: None,
             mru: Vec::new(),
+            cycle: None,
             bounds_dirty: false,
             refocus_pending: false,
             switch_requested,
@@ -322,6 +328,12 @@ impl App {
             return;
         }
 
+        self.cycle = None;
+        self.touch_mru(index);
+        self.activate_window_core(index);
+    }
+
+    fn activate_window_core(&mut self, index: usize) {
         if !self.reconcile_move_lift() {
             return;
         }
@@ -333,7 +345,6 @@ impl App {
         }
 
         self.active = Some(index);
-        self.touch_mru(index);
         self.native_host_events
             .active_pid
             .store(self.managed_windows[index].pid, Ordering::Release);
@@ -394,6 +405,84 @@ impl App {
 
         if let Some(next) = candidates.into_iter().next() {
             self.activate_window(next);
+        }
+    }
+
+    fn ctrl_held() -> bool {
+        let state = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) };
+        (state as u16 & KEY_PRESSED) != 0
+    }
+
+    fn begin_or_advance_tab_cycle(&mut self) {
+        if self.cycle.is_none() {
+            self.start_tab_cycle();
+        } else if let Some(session) = self.cycle.as_mut() {
+            session.step += 1;
+        }
+
+        self.activate_cycle_target();
+    }
+
+    fn start_tab_cycle(&mut self) {
+        let mut candidates: Vec<usize> = self
+            .mru
+            .iter()
+            .copied()
+            .filter(|index| {
+                *index < self.managed_windows.len() && self.managed_windows[*index].is_open()
+            })
+            .collect();
+
+        for (index, managed) in self.managed_windows.iter().enumerate() {
+            if managed.is_open() && !candidates.contains(&index) {
+                candidates.push(index);
+            }
+        }
+
+        if candidates.len() < 2 {
+            return;
+        }
+
+        let active_rank = self
+            .active
+            .and_then(|active| candidates.iter().position(|index| *index == active))
+            .unwrap_or(0);
+        let order: Vec<usize> = candidates
+            .iter()
+            .skip(active_rank + 1)
+            .chain(candidates.iter().take(active_rank + 1))
+            .copied()
+            .collect();
+
+        self.cycle = Some(CycleSession { order, step: 0 });
+    }
+
+    fn activate_cycle_target(&mut self) {
+        let resolved = {
+            let Some(session) = self.cycle.as_mut() else {
+                return;
+            };
+
+            session.order.retain(|&index| {
+                index < self.managed_windows.len() && self.managed_windows[index].is_open()
+            });
+
+            (!session.order.is_empty()).then(|| session.order[session.step % session.order.len()])
+        };
+
+        match resolved {
+            Some(target) => self.activate_window_core(target),
+            None => self.cycle = None,
+        }
+    }
+
+    fn commit_tab_cycle(&mut self) {
+        if self.cycle.take().is_some()
+            && let Some(active) = self.active
+            && active < self.managed_windows.len()
+            && self.managed_windows[active].is_open()
+        {
+            self.touch_mru(active);
         }
     }
 
@@ -649,6 +738,18 @@ impl App {
             .map(|index| new_index_of_old[*index])
             .collect();
 
+        if let Some(session) = &mut self.cycle {
+            session.order = session
+                .order
+                .iter()
+                .filter_map(|index| {
+                    let mapped = new_index_of_old[*index];
+                    (mapped != usize::MAX && self.managed_windows[mapped].is_open())
+                        .then_some(mapped)
+                })
+                .collect();
+        }
+
         self.mark_dirty();
         true
     }
@@ -744,6 +845,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 let _ = self.reconcile_move_lift();
+                self.cycle = None;
                 self.native_host_events
                     .active_hwnd
                     .store(0, Ordering::Release);
@@ -753,7 +855,7 @@ impl ApplicationHandler for App {
                 self.active = None;
                 self.bounds_dirty = false;
                 self.refocus_pending = false;
-                self.switch_requested.store(false, Ordering::Release);
+                self.switch_requested.store(0, Ordering::Release);
                 self.close_all_managed_windows();
                 event_loop.exit();
             }
@@ -828,7 +930,16 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.cycle.is_some() && !Self::ctrl_held() {
+            self.commit_tab_cycle();
+        }
+        event_loop.set_control_flow(if self.cycle.is_some() {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
+
         let move_finished = self
             .native_host_events
             .size_move_finished
@@ -846,11 +957,23 @@ impl ApplicationHandler for App {
             self.refocus_pending = lift_released && self.group_is_foreground();
         }
 
-        if self.switch_requested.swap(false, Ordering::AcqRel) {
-            self.activate_next_window();
+        while self
+            .switch_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.begin_or_advance_tab_cycle();
         }
 
-        if self.new_tab_requested.swap(false, Ordering::AcqRel) {
+        while self
+            .new_tab_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
             self.spawn_new_tab();
         }
 
