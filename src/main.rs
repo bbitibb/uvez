@@ -16,6 +16,8 @@ use winit::platform::windows::EventLoopBuilderExtWindows;
 use crate::app::App;
 
 fn main() -> WinResult<()> {
+    guest::install_panic_restore_hook();
+
     let switch_requested = Arc::new(AtomicU32::new(0));
     let hook_switch_requested = Arc::clone(&switch_requested);
 

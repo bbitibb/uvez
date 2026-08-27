@@ -1,5 +1,8 @@
+use std::ffi::c_void;
+use std::panic;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +57,37 @@ pub(crate) struct ManagedWindow {
     original_placement: WINDOWPLACEMENT,
     originally_visible: bool,
     managed_mode: bool,
+}
+
+pub(crate) type ManagedWindowArrival = std::result::Result<DiscoveredWindow, String>;
+
+pub(crate) struct DiscoveredWindow {
+    hwnd: isize,
+    pid: u32,
+    title: String,
+    exe_name: String,
+    original_style: u32,
+    original_ex_style: u32,
+    original_rect: RECT,
+    original_placement: WINDOWPLACEMENT,
+    originally_visible: bool,
+}
+
+impl DiscoveredWindow {
+    pub(crate) fn into_managed_window(self) -> ManagedWindow {
+        ManagedWindow {
+            hwnd: HWND(self.hwnd as *mut c_void),
+            pid: self.pid,
+            title: self.title,
+            exe_name: self.exe_name,
+            original_style: self.original_style,
+            original_ex_style: self.original_ex_style,
+            original_rect: self.original_rect,
+            original_placement: self.original_placement,
+            originally_visible: self.originally_visible,
+            managed_mode: false,
+        }
+    }
 }
 
 fn get_window_attribute(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> Result<u32, String> {
@@ -160,6 +194,16 @@ impl ManagedWindow {
             return Err(error);
         }
 
+        lock_restore_registry().push(RestoreRecord {
+            hwnd: self.hwnd.0 as isize,
+            original_style: self.original_style,
+            original_ex_style: self.original_ex_style,
+            original_rect: self.original_rect,
+            original_placement: self.original_placement,
+            originally_topmost: self.original_ex_style & WS_EX_TOPMOST.0 != 0,
+            originally_visible: self.originally_visible,
+        });
+
         Ok(())
     }
 
@@ -170,6 +214,7 @@ impl ManagedWindow {
 
         if !self.is_open() {
             self.managed_mode = false;
+            unregister_panic_restore(self.hwnd);
             return Ok(());
         }
 
@@ -226,6 +271,7 @@ impl ManagedWindow {
 
         if restore_result.is_ok() {
             self.managed_mode = false;
+            unregister_panic_restore(self.hwnd);
             unsafe {
                 let command = if self.originally_visible {
                     SHOW_WINDOW_CMD(self.original_placement.showCmd as i32)
@@ -303,7 +349,6 @@ impl ManagedWindow {
         }
 
         self.hide();
-        self.managed_mode = false;
 
         unsafe {
             if let Err(error) = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) {
@@ -403,17 +448,109 @@ pub(crate) fn get_window_title(hwnd: HWND) -> String {
     }
 }
 
-fn launch_process(process_name: &str, args: &[&str]) -> std::io::Result<u32> {
+fn launch_process(process_name: &str, args: &[String]) -> std::io::Result<u32> {
     Command::new(process_name)
         .args(args)
         .spawn()
         .map(|child| child.id())
 }
 
-pub(crate) fn create_managed_window(
+struct RestoreRecord {
+    hwnd: isize,
+    original_style: u32,
+    original_ex_style: u32,
+    original_rect: RECT,
+    original_placement: WINDOWPLACEMENT,
+    originally_topmost: bool,
+    originally_visible: bool,
+}
+
+static RESTORE_REGISTRY: Mutex<Vec<RestoreRecord>> = Mutex::new(Vec::new());
+
+fn lock_restore_registry() -> MutexGuard<'static, Vec<RestoreRecord>> {
+    RESTORE_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn install_panic_restore_hook() {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        restore_registered_windows();
+        previous_hook(info);
+    }));
+}
+
+fn restore_registered_windows() {
+    let records = std::mem::take(&mut *lock_restore_registry());
+
+    for record in records {
+        restore_record(&record);
+    }
+}
+
+fn restore_record(record: &RestoreRecord) {
+    let hwnd = HWND(record.hwnd as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+
+    let insertion_band = if record.originally_topmost {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+
+    unsafe {
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, record.original_style as isize);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, record.original_ex_style as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            record.original_rect.left,
+            record.original_rect.top,
+            record.original_rect.right - record.original_rect.left,
+            record.original_rect.bottom - record.original_rect.top,
+            SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let _ = SetWindowPlacement(hwnd, &record.original_placement);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(insertion_band),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let command = if record.originally_visible {
+            SHOW_WINDOW_CMD(record.original_placement.showCmd as i32)
+        } else {
+            SW_HIDE
+        };
+        let _ = ShowWindow(hwnd, command);
+    }
+}
+
+fn unregister_panic_restore(hwnd: HWND) {
+    let value = hwnd.0 as isize;
+    lock_restore_registry().retain(|record| record.hwnd != value);
+}
+
+pub(crate) fn request_managed_window(
     process_name: &str,
     args: &[&str],
-) -> std::result::Result<ManagedWindow, String> {
+    sender: mpsc::Sender<ManagedWindowArrival>,
+) {
+    let process_name = process_name.to_string();
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+
+    thread::spawn(move || {
+        let _ = sender.send(discover_managed_window(&process_name, &args));
+    });
+}
+
+fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindowArrival {
     let pid = launch_process(process_name, args)
         .map_err(|error| format!("failed to launch {process_name}: {error}"))?;
     let deadline = Instant::now() + WINDOW_DISCOVERY_TIMEOUT;
@@ -439,8 +576,8 @@ pub(crate) fn create_managed_window(
                 })?;
             }
 
-            return Ok(ManagedWindow {
-                hwnd: info.hwnd,
+            return Ok(DiscoveredWindow {
+                hwnd: info.hwnd.0 as isize,
                 pid,
                 title: format_title(&info.title, process_name),
                 exe_name: process_name.to_string(),
@@ -449,7 +586,6 @@ pub(crate) fn create_managed_window(
                 original_rect,
                 original_placement,
                 originally_visible: unsafe { IsWindowVisible(info.hwnd).as_bool() },
-                managed_mode: false,
             });
         }
 

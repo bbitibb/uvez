@@ -2,10 +2,11 @@ use std::ffi::c_void;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
-use crate::guest::{self, ManagedWindow, WindowBounds, create_managed_window};
+use crate::guest::{self, ManagedWindow, WindowBounds};
 use crate::host_events::{
     self, HOST_SUBCLASS_ID, HOST_SUBCLASS_PROC, NativeHostEvents, release_subclass_reference,
 };
@@ -28,6 +29,7 @@ use winit::window::{Window, WindowId};
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
 pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
+const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
 
 struct CycleSession {
@@ -48,7 +50,11 @@ pub(crate) struct App {
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
-    hotkey_registered: bool,
+    hotkey_switch_registered: bool,
+    hotkey_new_tab_registered: bool,
+    arrival_tx: mpsc::Sender<guest::ManagedWindowArrival>,
+    arrival_rx: mpsc::Receiver<guest::ManagedWindowArrival>,
+    startup_spawns_pending: usize,
     tab_bar: Option<TabBar>,
     cursor_pos: Option<(i32, i32)>,
     last_housekeeping: Instant,
@@ -56,6 +62,8 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(switch_requested: Arc<AtomicU32>, new_tab_requested: Arc<AtomicU32>) -> Self {
+        let (arrival_tx, arrival_rx) = mpsc::channel();
+
         Self {
             window: None,
             managed_windows: Vec::new(),
@@ -69,7 +77,11 @@ impl App {
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
-            hotkey_registered: false,
+            hotkey_switch_registered: false,
+            hotkey_new_tab_registered: false,
+            arrival_tx,
+            arrival_rx,
+            startup_spawns_pending: 0,
             tab_bar: None,
             cursor_pos: None,
             last_housekeeping: Instant::now(),
@@ -100,18 +112,22 @@ impl App {
         (TAB_BAR_HEIGHT_LOGICAL * self.scale_factor()).round() as i32
     }
 
-    fn add_managed_window(&mut self, managed: ManagedWindow) -> Result<(), String> {
+    fn add_managed_window(&mut self, managed: ManagedWindow) -> Result<usize, String> {
         let index = self.managed_windows.len();
         self.managed_windows.push(managed);
 
-        self.managed_windows[index].enter_managed_mode()?;
+        if let Err(error) = self.managed_windows[index].enter_managed_mode() {
+            self.managed_windows.remove(index);
+            return Err(error);
+        }
+
         let managed = &self.managed_windows[index];
         println!(
             "Managing {} (PID {}, HWND {:?}): {}",
             managed.exe_name, managed.pid, managed.hwnd, managed.title
         );
         self.mark_dirty();
-        Ok(())
+        Ok(index)
     }
 
     fn hide_window(&mut self, index: usize) {
@@ -375,6 +391,7 @@ impl App {
         self.refocus_pending = false;
         self.update_host_title();
         self.mark_dirty();
+        self.update_hotkey_registration();
     }
 
     fn activate_next_window(&mut self) {
@@ -537,64 +554,97 @@ impl App {
         }
     }
 
-    fn spawn_new_tab(&mut self) {
-        match create_managed_window("alacritty.exe", &[]) {
-            Ok(managed) => {
-                if let Err(error) = self.add_managed_window(managed) {
-                    eprintln!("Could not manage new window: {error}");
-                    return;
+    fn adopt_arrival(
+        &mut self,
+        arrival: guest::ManagedWindowArrival,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let startup = self.startup_spawns_pending > 0;
+        if startup {
+            self.startup_spawns_pending -= 1;
+        }
+
+        match arrival {
+            Ok(discovered) => {
+                let index = match self.add_managed_window(discovered.into_managed_window()) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        eprintln!("Could not manage new window: {error}");
+                        if startup && self.active.is_none() {
+                            self.reveal_managed_windows();
+                            event_loop.exit();
+                        }
+                        return;
+                    }
+                };
+
+                if !startup || self.active.is_none() {
+                    self.activate_window(index);
                 }
-                let new_index = self.managed_windows.len().saturating_sub(1);
-                self.activate_window(new_index);
             }
             Err(error) => {
-                eprintln!("Could not create new window: {error}");
+                eprintln!("Could not create managed window: {error}");
+                if startup && self.active.is_none() {
+                    self.reveal_managed_windows();
+                    event_loop.exit();
+                }
             }
         }
+    }
+
+    fn spawn_new_tab(&mut self) {
+        guest::request_managed_window("alacritty.exe", &[], self.arrival_tx.clone());
     }
 
     fn register_hotkeys(&mut self) {
-        let switch_res = unsafe {
-            RegisterHotKey(
-                None,
-                SWITCH_HOTKEY_ID,
-                MOD_CONTROL | MOD_NOREPEAT,
-                u32::from(VK_TAB.0),
-            )
-        };
-        match switch_res {
-            Ok(()) => println!("Press Ctrl+Tab to switch to the most recently used tab"),
-            Err(error) => eprintln!("Could not register Ctrl+Tab: {error}"),
+        if !self.hotkey_switch_registered {
+            match unsafe {
+                RegisterHotKey(
+                    None,
+                    SWITCH_HOTKEY_ID,
+                    MOD_CONTROL | MOD_NOREPEAT,
+                    u32::from(VK_TAB.0),
+                )
+            } {
+                Ok(()) => self.hotkey_switch_registered = true,
+                Err(error) => eprintln!("Could not register Ctrl+Tab: {error}"),
+            }
         }
 
-        let new_tab_res = unsafe {
-            RegisterHotKey(
-                None,
-                NEW_TAB_HOTKEY_ID,
-                MOD_CONTROL | MOD_NOREPEAT,
-                u32::from(VK_T.0),
-            )
-        };
-        match new_tab_res {
-            Ok(()) => println!("Press Ctrl+T to open a new tab"),
-            Err(error) => eprintln!("Could not register Ctrl+T: {error}"),
+        if !self.hotkey_new_tab_registered {
+            match unsafe {
+                RegisterHotKey(
+                    None,
+                    NEW_TAB_HOTKEY_ID,
+                    MOD_CONTROL | MOD_NOREPEAT,
+                    u32::from(VK_T.0),
+                )
+            } {
+                Ok(()) => self.hotkey_new_tab_registered = true,
+                Err(error) => eprintln!("Could not register Ctrl+T: {error}"),
+            }
         }
-
-        self.hotkey_registered = true;
     }
 
     fn unregister_hotkeys(&mut self) {
-        if !self.hotkey_registered {
-            return;
+        if self.hotkey_switch_registered
+            && unsafe { UnregisterHotKey(None, SWITCH_HOTKEY_ID) }.is_ok()
+        {
+            self.hotkey_switch_registered = false;
         }
+        if self.hotkey_new_tab_registered
+            && unsafe { UnregisterHotKey(None, NEW_TAB_HOTKEY_ID) }.is_ok()
+        {
+            self.hotkey_new_tab_registered = false;
+        }
+    }
 
-        if let Err(error) = unsafe { UnregisterHotKey(None, SWITCH_HOTKEY_ID) } {
-            eprintln!("Could not unregister Ctrl+Tab: {error}");
+    fn update_hotkey_registration(&mut self) {
+        if self.group_is_foreground() {
+            self.register_hotkeys();
+        } else {
+            self.unregister_hotkeys();
         }
-        if let Err(error) = unsafe { UnregisterHotKey(None, NEW_TAB_HOTKEY_ID) } {
-            eprintln!("Could not unregister Ctrl+T: {error}");
-        }
-        self.hotkey_registered = false;
     }
 
     fn draw_tab_bar(&mut self) {
@@ -785,6 +835,8 @@ impl App {
         if self.prune_dead_guests() && active_died {
             self.activate_next_window();
         }
+
+        self.update_hotkey_registration();
     }
 }
 
@@ -813,27 +865,14 @@ impl ApplicationHandler for App {
             }
         }
 
-        for _ in 0..2 {
-            match create_managed_window("alacritty.exe", &[]) {
-                Ok(managed) => {
-                    if let Err(error) = self.add_managed_window(managed) {
-                        eprintln!("Could not manage window: {error}");
-                        self.reveal_managed_windows();
-                        event_loop.exit();
-                        return;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("Could not create managed window: {error}");
-                    self.reveal_managed_windows();
-                    event_loop.exit();
-                    return;
-                }
-            }
+        for _ in 0..STARTUP_TAB_COUNT {
+            self.spawn_new_tab();
         }
 
-        self.register_hotkeys();
-        self.activate_window(0);
+        println!(
+            "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab"
+        );
+        self.update_hotkey_registration();
     }
 
     fn window_event(
@@ -868,6 +907,7 @@ impl ApplicationHandler for App {
                 self.raise_active_without_activation();
                 self.sync_group_bounds();
                 self.refocus_pending = true;
+                self.update_hotkey_registration();
             }
 
             WindowEvent::Focused(false) => {
@@ -875,6 +915,7 @@ impl ApplicationHandler for App {
                 if !self.group_is_foreground() {
                     self.refocus_pending = false;
                 }
+                self.update_hotkey_registration();
             }
 
             WindowEvent::Moved(_) => {
@@ -937,7 +978,7 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(if self.cycle.is_some() {
             ControlFlow::Poll
         } else {
-            ControlFlow::Wait
+            ControlFlow::WaitUntil(self.last_housekeeping + HOUSEKEEPING_INTERVAL)
         });
 
         let move_finished = self
@@ -955,6 +996,10 @@ impl ApplicationHandler for App {
         if move_finished {
             self.sync_group_bounds();
             self.refocus_pending = lift_released && self.group_is_foreground();
+        }
+
+        while let Ok(arrival) = self.arrival_rx.try_recv() {
+            self.adopt_arrival(arrival, event_loop);
         }
 
         while self
