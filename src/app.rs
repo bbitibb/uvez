@@ -131,10 +131,13 @@ impl App {
     }
 
     fn add_managed_window(&mut self, managed: ManagedWindow) -> Result<usize, String> {
+        let owner = self
+            .host_hwnd()
+            .ok_or_else(|| "Uvez host window is unavailable".to_string())?;
         let index = self.managed_windows.len();
         self.managed_windows.push(managed);
 
-        if let Err(error) = self.managed_windows[index].enter_managed_mode() {
+        if let Err(error) = self.managed_windows[index].enter_managed_mode(owner) {
             self.managed_windows.remove(index);
             return Err(error);
         }

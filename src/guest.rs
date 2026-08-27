@@ -10,8 +10,8 @@ use windows::Win32::Foundation::{
     ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT, SetLastError, WPARAM,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible,
     PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
@@ -53,6 +53,7 @@ pub(crate) struct ManagedWindow {
     pub(crate) exe_name: String,
     original_style: u32,
     original_ex_style: u32,
+    original_owner: isize,
     original_rect: RECT,
     original_placement: WINDOWPLACEMENT,
     originally_visible: bool,
@@ -68,6 +69,7 @@ pub(crate) struct DiscoveredWindow {
     exe_name: String,
     original_style: u32,
     original_ex_style: u32,
+    original_owner: isize,
     original_rect: RECT,
     original_placement: WINDOWPLACEMENT,
     originally_visible: bool,
@@ -82,6 +84,7 @@ impl DiscoveredWindow {
             exe_name: self.exe_name,
             original_style: self.original_style,
             original_ex_style: self.original_ex_style,
+            original_owner: self.original_owner,
             original_rect: self.original_rect,
             original_placement: self.original_placement,
             originally_visible: self.originally_visible,
@@ -128,13 +131,30 @@ fn set_window_attribute(
     }
 }
 
+fn set_window_owner(hwnd: HWND, owner: isize) -> Result<(), String> {
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+        let previous = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
+        let error = GetLastError();
+
+        if previous == 0 && error != ERROR_SUCCESS {
+            Err(format!(
+                "SetWindowLongPtrW(GWLP_HWNDPARENT) failed with Win32 error {}",
+                error.0
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ManagedWindow {
     pub(crate) fn is_open(&self) -> bool {
         let exists = unsafe { IsWindow(Some(self.hwnd)).as_bool() };
         exists && get_window_process_id(self.hwnd) == self.pid
     }
 
-    pub(crate) fn enter_managed_mode(&mut self) -> Result<(), String> {
+    pub(crate) fn enter_managed_mode(&mut self, owner: HWND) -> Result<(), String> {
         if self.managed_mode {
             return Ok(());
         }
@@ -153,8 +173,9 @@ impl ManagedWindow {
             let current_style = get_window_attribute(self.hwnd, GWL_STYLE)?;
             let current_ex_style = get_window_attribute(self.hwnd, GWL_EXSTYLE)?;
             let managed_style = current_style & !MANAGED_STYLE_MASK;
-            let managed_ex_style = (current_ex_style & !MANAGED_EX_STYLE_MASK) | WS_EX_TOOLWINDOW.0;
+            let managed_ex_style = current_ex_style & !(MANAGED_EX_STYLE_MASK | WS_EX_TOOLWINDOW.0);
 
+            set_window_owner(self.hwnd, owner.0 as isize)?;
             set_window_attribute(self.hwnd, GWL_STYLE, managed_style)?;
             set_window_attribute(self.hwnd, GWL_EXSTYLE, managed_ex_style)?;
 
@@ -173,13 +194,15 @@ impl ManagedWindow {
 
             let actual_style = get_window_attribute(self.hwnd, GWL_STYLE)?;
             let actual_ex_style = get_window_attribute(self.hwnd, GWL_EXSTYLE)?;
+            let actual_owner = unsafe { GetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT) };
             if actual_style & WS_CHILD.0 != 0
                 || actual_style & MANAGED_STYLE_MASK != 0
                 || actual_ex_style & MANAGED_EX_STYLE_MASK != 0
-                || actual_ex_style & WS_EX_TOOLWINDOW.0 == 0
+                || actual_ex_style & WS_EX_TOOLWINDOW.0 != 0
+                || actual_owner != owner.0 as isize
             {
                 return Err(format!(
-                    "managed HWND {:?} rejected its borderless top-level configuration",
+                    "managed HWND {:?} rejected its owned borderless configuration",
                     self.hwnd
                 ));
             }
@@ -198,6 +221,7 @@ impl ManagedWindow {
             hwnd: self.hwnd.0 as isize,
             original_style: self.original_style,
             original_ex_style: self.original_ex_style,
+            original_owner: self.original_owner,
             original_rect: self.original_rect,
             original_placement: self.original_placement,
             originally_topmost: self.original_ex_style & WS_EX_TOPMOST.0 != 0,
@@ -231,6 +255,7 @@ impl ManagedWindow {
 
         let style_result = set_window_attribute(self.hwnd, GWL_STYLE, restored_style);
         let ex_style_result = set_window_attribute(self.hwnd, GWL_EXSTYLE, restored_ex_style);
+        let owner_result = set_window_owner(self.hwnd, self.original_owner);
         let frame_result = unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -265,6 +290,7 @@ impl ManagedWindow {
 
         let restore_result = style_result
             .and(ex_style_result)
+            .and(owner_result)
             .and(frame_result)
             .and(placement_result)
             .and(z_order_result);
@@ -459,6 +485,7 @@ struct RestoreRecord {
     hwnd: isize,
     original_style: u32,
     original_ex_style: u32,
+    original_owner: isize,
     original_rect: RECT,
     original_placement: WINDOWPLACEMENT,
     originally_topmost: bool,
@@ -504,6 +531,7 @@ fn restore_record(record: &RestoreRecord) {
     unsafe {
         let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, record.original_style as isize);
         let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, record.original_ex_style as isize);
+        let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, record.original_owner);
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -603,6 +631,7 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
                 exe_name: process_name.to_string(),
                 original_style,
                 original_ex_style,
+                original_owner: unsafe { GetWindowLongPtrW(info.hwnd, GWLP_HWNDPARENT) },
                 original_rect,
                 original_placement,
                 originally_visible,

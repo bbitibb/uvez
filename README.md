@@ -12,7 +12,7 @@ Instead of relying on terminal-specific tab implementations or tiling window man
 
 - **Borderless hosting**: Strips native window chrome (`WS_CAPTION`, `WS_THICKFRAME`) and aligns the guest window inside the container.
 - **Zero-lag drag sync**: Uses Win32 window subclassing and atomic Z-order lifting so the hosted window moves 1:1 with the host frame without stutter or lag.
-- **Clean Alt+Tab / Taskbar integration**: Hides hosted guest windows from Alt+Tab and the Taskbar using `WS_EX_TOOLWINDOW`, so only Uvez appears in your application switcher.
+- **Clean Alt+Tab / Taskbar integration**: Makes hosted guest windows owned by the container, so they group under Uvez and never appear as separate Taskbar or Alt+Tab entries.
 - **Software-rendered tab bar**: A minimal tab strip rendered via `softbuffer` and `fontdue` (Cascadia Code) that only redraws on state changes.
 - **MRU Tab Switching**: `Ctrl + Tab` toggles between your most recently used tabs first.
 
