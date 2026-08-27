@@ -10,16 +10,23 @@ use crate::guest::{self, ManagedWindow, WindowBounds};
 use crate::host_events::{
     self, HOST_SUBCLASS_ID, HOST_SUBCLASS_PROC, NativeHostEvents, release_subclass_reference,
 };
-use crate::tabbar::{Hit, TAB_BAR_HEIGHT_LOGICAL, TabBar, TabModel};
-use windows::Win32::Foundation::HWND;
+use crate::tabbar::{
+    COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE, Hit, TAB_BAR_HEIGHT_LOGICAL, TAB_BORDER_WIDTH,
+    TabBar, TabModel,
+};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_CONTROL,
-    VK_T, VK_TAB,
+    GetAsyncKeyState, GetDoubleClickTime, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
+    UnregisterHotKey, VK_CONTROL, VK_T, VK_TAB,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HWND_TOP, MB_ICONERROR, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SetWindowPos,
+    GetForegroundWindow, HWND_TOP, MB_ICONERROR, MessageBoxW, PostMessageW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_CLOSE,
 };
 use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
@@ -53,6 +60,35 @@ fn show_error_box(message: &str) {
     }
 }
 
+fn apply_dwm_rounding(hwnd: HWND) {
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
+}
+
+fn apply_dwm_border_color(hwnd: HWND, focused: bool) {
+    let rgb = if focused {
+        COLOR_BORDER_ACTIVE
+    } else {
+        COLOR_BORDER_INACTIVE
+    };
+    let color = COLORREF(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF));
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const COLORREF as *const c_void,
+            size_of::<COLORREF>() as u32,
+        );
+    }
+}
+
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
@@ -74,6 +110,8 @@ pub(crate) struct App {
     startup_spawns_pending: usize,
     tab_bar: Option<TabBar>,
     cursor_pos: Option<(i32, i32)>,
+    last_strip_click: Option<(Instant, i32, i32)>,
+    dwm_border_focused: Option<bool>,
     last_housekeeping: Instant,
 }
 
@@ -102,6 +140,8 @@ impl App {
             startup_spawns_pending: 0,
             tab_bar: None,
             cursor_pos: None,
+            last_strip_click: None,
+            dwm_border_focused: None,
             last_housekeeping: Instant::now(),
         }
     }
@@ -217,16 +257,19 @@ impl App {
         let position = window.inner_position().ok()?;
         let size = window.inner_size();
         let strip_height = self.tab_strip_height();
-        let height = size.height as i32 - strip_height;
+        let border = TAB_BORDER_WIDTH;
+        let raw_width = i32::try_from(size.width).ok()?;
+        let width = raw_width - border * 2;
+        let height = size.height as i32 - strip_height - border;
 
-        if size.width == 0 || height <= 0 {
+        if width <= 0 || height <= 0 {
             return None;
         }
 
         Some(WindowBounds {
-            x: position.x,
+            x: position.x + border,
             y: position.y + strip_height,
-            width: size.width.try_into().ok()?,
+            width,
             height,
         })
     }
@@ -413,6 +456,7 @@ impl App {
         self.update_host_title();
         self.mark_dirty();
         self.update_hotkey_registration();
+        self.sync_tab_bar_focus();
     }
 
     fn activate_next_window(&mut self) {
@@ -686,6 +730,20 @@ impl App {
         }
     }
 
+    fn sync_tab_bar_focus(&mut self) {
+        let focused = self.group_is_foreground();
+        if let Some(tab_bar) = self.tab_bar.as_mut() {
+            tab_bar.set_focused(focused);
+        }
+
+        if self.dwm_border_focused != Some(focused)
+            && let Some(hwnd) = self.host_hwnd()
+        {
+            self.dwm_border_focused = Some(focused);
+            apply_dwm_border_color(hwnd, focused);
+        }
+    }
+
     fn draw_tab_bar(&mut self) {
         let size = self.window.as_deref().map(Window::inner_size);
         let Some(size) = size else { return };
@@ -723,6 +781,19 @@ impl App {
 
         if let Some(tab_bar) = self.tab_bar.as_mut() {
             tab_bar.set_hover(hit);
+        }
+    }
+
+    fn toggle_host_maximized(&mut self) {
+        if let Some(window) = self.window.as_deref() {
+            let maximized = window.is_maximized();
+            window.set_maximized(!maximized);
+        }
+    }
+
+    fn begin_host_drag(&mut self) {
+        if let Some(window) = self.window.as_deref() {
+            let _ = window.drag_window();
         }
     }
 
@@ -777,6 +848,39 @@ impl App {
                 if was_active {
                     self.activate_next_window();
                 }
+            }
+            (MouseButton::Left, Hit::Minimize) => {
+                if let Some(window) = self.window.as_deref() {
+                    window.set_minimized(true);
+                }
+            }
+            (MouseButton::Left, Hit::Maximize) => self.toggle_host_maximized(),
+            (MouseButton::Left, Hit::CloseWindow) => {
+                if let Some(hwnd) = self.host_hwnd() {
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            (MouseButton::Left, Hit::None) => {
+                if y >= self.tab_strip_height() {
+                    return;
+                }
+
+                let double_click_time = unsafe { GetDoubleClickTime() } as u128;
+                let snap = (4.0 * self.scale_factor()) as i32;
+                if let Some((when, last_x, last_y)) = self.last_strip_click
+                    && when.elapsed().as_millis() <= double_click_time
+                    && (last_x - x).abs() <= snap
+                    && (last_y - y).abs() <= snap
+                {
+                    self.last_strip_click = None;
+                    self.toggle_host_maximized();
+                    return;
+                }
+
+                self.last_strip_click = Some((Instant::now(), x, y));
+                self.begin_host_drag();
             }
             _ => {}
         }
@@ -876,6 +980,7 @@ impl App {
         }
 
         self.update_hotkey_registration();
+        self.sync_tab_bar_focus();
     }
 }
 
@@ -895,6 +1000,21 @@ impl ApplicationHandler for App {
             ));
             event_loop.exit();
             return;
+        }
+
+        if let Some(hwnd) = self.host_hwnd() {
+            apply_dwm_rounding(hwnd);
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
         }
 
         match TabBar::new(self.window.as_ref().expect("host window exists")) {
@@ -918,6 +1038,7 @@ impl ApplicationHandler for App {
             "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab"
         );
         self.update_hotkey_registration();
+        self.sync_tab_bar_focus();
     }
 
     fn window_event(
@@ -953,6 +1074,7 @@ impl ApplicationHandler for App {
                 self.sync_group_bounds();
                 self.refocus_pending = true;
                 self.update_hotkey_registration();
+                self.sync_tab_bar_focus();
             }
 
             WindowEvent::Focused(false) => {
@@ -961,6 +1083,7 @@ impl ApplicationHandler for App {
                     self.refocus_pending = false;
                 }
                 self.update_hotkey_registration();
+                self.sync_tab_bar_focus();
             }
 
             WindowEvent::Moved(_) => {

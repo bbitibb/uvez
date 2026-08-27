@@ -4,12 +4,15 @@ use std::sync::{
     atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
 };
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{DefSubclassProc, SUBCLASSPROC};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, HWND_NOTOPMOST, HWND_TOPMOST,
+    GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT,
+    HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST,
+    HWND_TOPMOST, IsZoomed, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WM_CANCELMODE, WM_ENTERSIZEMOVE,
-    WM_EXITSIZEMOVE, WM_NCDESTROY, WS_EX_TOPMOST,
+    WM_EXITSIZEMOVE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WS_EX_TOPMOST,
 };
 
 use crate::guest::get_window_process_id;
@@ -36,6 +39,16 @@ pub(crate) fn hwnd_from_atomic(value: isize) -> HWND {
 
 fn hwnd_matches_pid(hwnd: HWND, expected_pid: u32) -> bool {
     expected_pid != 0 && get_window_process_id(hwnd) == expected_pid
+}
+
+fn frame_thickness(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let padded = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        let frame_x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + padded;
+        let frame_y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + padded;
+        (frame_x, frame_y)
+    }
 }
 
 fn lift_active_guest(events: &NativeHostEvents, host_hwnd: HWND) {
@@ -141,6 +154,44 @@ unsafe extern "system" fn host_subclass_proc(
         let events = unsafe { &*(reference_data as *const NativeHostEvents) };
 
         match message {
+            WM_NCCALCSIZE if wparam.0 != 0 => {
+                if (unsafe { IsZoomed(hwnd) }).as_bool() {
+                    let (frame_x, frame_y) = frame_thickness(hwnd);
+                    let params = unsafe { &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS) };
+                    let rect = &mut params.rgrc[0];
+                    rect.left += frame_x;
+                    rect.top += frame_y;
+                    rect.right -= frame_x;
+                    rect.bottom -= frame_y;
+                }
+                return LRESULT(0);
+            }
+            WM_NCHITTEST if !(unsafe { IsZoomed(hwnd) }).as_bool() => {
+                let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let mut rect = RECT::default();
+                let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+                let (frame_x, frame_y) = frame_thickness(hwnd);
+
+                let left = x < rect.left + frame_x;
+                let right = x >= rect.right - frame_x;
+                let top = y < rect.top + frame_y;
+                let bottom = y >= rect.bottom - frame_y;
+
+                let hit = match (left, right, top, bottom) {
+                    (true, _, true, _) => HTTOPLEFT,
+                    (_, true, true, _) => HTTOPRIGHT,
+                    (true, _, _, true) => HTBOTTOMLEFT,
+                    (_, true, _, true) => HTBOTTOMRIGHT,
+                    (true, _, _, _) => HTLEFT,
+                    (_, true, _, _) => HTRIGHT,
+                    (_, _, true, _) => HTTOP,
+                    (_, _, _, true) => HTBOTTOM,
+                    _ => HTCLIENT,
+                };
+
+                return LRESULT(hit as isize);
+            }
             WM_ENTERSIZEMOVE => {
                 events.size_move_finished.store(false, Ordering::Release);
                 events.in_size_move.store(true, Ordering::Release);

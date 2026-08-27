@@ -6,6 +6,7 @@ use softbuffer::{Context, Surface};
 use winit::window::Window;
 
 pub(crate) const TAB_BAR_HEIGHT_LOGICAL: f64 = 32.0;
+pub(crate) const TAB_BORDER_WIDTH: i32 = 1;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/CascadiaCode-Regular.ttf");
 
@@ -20,12 +21,19 @@ const COLOR_TEXT: u32 = 0x00C0CAF5;
 const COLOR_TEXT_DIM: u32 = 0x00565F89;
 const COLOR_CLOSE_BG: u32 = 0x002A2E42;
 const COLOR_CLOSE_GLYPH: u32 = 0x00F7768E;
+const COLOR_WINDOW_CLOSE_BG: u32 = 0x00C42B1C;
+const COLOR_WHITE: u32 = 0x00FFFFFF;
+pub(crate) const COLOR_BORDER_ACTIVE: u32 = 0x00414868;
+pub(crate) const COLOR_BORDER_INACTIVE: u32 = 0x00232433;
 
 #[derive(Debug)]
 pub(crate) enum Hit {
     Tab(usize),
     Close(usize),
     NewTab,
+    Minimize,
+    Maximize,
+    CloseWindow,
     None,
 }
 
@@ -65,9 +73,12 @@ pub(crate) struct TabBar {
     buffer_height: u32,
     layout: Vec<TabSlot>,
     new_tab_slot: Option<Rect>,
+    window_controls: Option<[Rect; 3]>,
     hover_tab: Option<usize>,
     hover_close: Option<usize>,
     hover_new_tab: bool,
+    hover_control: Option<usize>,
+    focused: bool,
     dirty: bool,
 }
 
@@ -109,9 +120,12 @@ impl TabBar {
             buffer_height: 0,
             layout: Vec::new(),
             new_tab_slot: None,
+            window_controls: None,
             hover_tab: None,
             hover_close: None,
             hover_new_tab: false,
+            hover_control: None,
+            focused: false,
             dirty: true,
         })
     }
@@ -136,18 +150,33 @@ impl TabBar {
         }
     }
 
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        if focused != self.focused {
+            self.focused = focused;
+            self.dirty = true;
+        }
+    }
+
     pub(crate) fn set_hover(&mut self, hit: Hit) {
-        let (tab, close, new_tab) = match hit {
-            Hit::Tab(index) => (Some(index), None, false),
-            Hit::Close(index) => (None, Some(index), false),
-            Hit::NewTab => (None, None, true),
-            Hit::None => (None, None, false),
+        let (tab, close, new_tab, control) = match hit {
+            Hit::Tab(index) => (Some(index), None, false, None),
+            Hit::Close(index) => (None, Some(index), false, None),
+            Hit::NewTab => (None, None, true, None),
+            Hit::Minimize => (None, None, false, Some(0)),
+            Hit::Maximize => (None, None, false, Some(1)),
+            Hit::CloseWindow => (None, None, false, Some(2)),
+            Hit::None => (None, None, false, None),
         };
 
-        if tab != self.hover_tab || close != self.hover_close || new_tab != self.hover_new_tab {
+        if tab != self.hover_tab
+            || close != self.hover_close
+            || new_tab != self.hover_new_tab
+            || control != self.hover_control
+        {
             self.hover_tab = tab;
             self.hover_close = close;
             self.hover_new_tab = new_tab;
+            self.hover_control = control;
             self.dirty = true;
         }
     }
@@ -157,6 +186,18 @@ impl TabBar {
     }
 
     pub(crate) fn hit_test(&self, x: i32, y: i32) -> Hit {
+        if let Some(controls) = &self.window_controls {
+            for (index, rect) in controls.iter().enumerate() {
+                if rect.contains(x, y) {
+                    return match index {
+                        0 => Hit::Minimize,
+                        1 => Hit::Maximize,
+                        _ => Hit::CloseWindow,
+                    };
+                }
+            }
+        }
+
         if let Some(new_tab) = self.new_tab_slot
             && new_tab.contains(x, y)
         {
@@ -216,6 +257,7 @@ impl TabBar {
 
         self.layout.clear();
         self.new_tab_slot = None;
+        self.window_controls = None;
 
         let scaled = |value: f64| -> i32 { (value * self.scale).round() as i32 };
         let padding = scaled(6.0);
@@ -223,6 +265,8 @@ impl TabBar {
         let inset_y = scaled(4.0);
         let min_tab_width = scaled(90.0);
         let max_tab_width = scaled(220.0);
+        let control_size = strip_height;
+        let controls_space = control_size * 3;
 
         let line_metrics = self.font.horizontal_line_metrics(self.font_px);
         let (ascent, descent) = match line_metrics {
@@ -235,7 +279,8 @@ impl TabBar {
             let tab_height = strip_height - inset_y * 2;
             let new_tab_size = tab_height;
             let button_space = new_tab_size + gap;
-            let available = (stride - padding * 2 - button_space - gap * (count - 1)).max(0);
+            let available =
+                (stride - padding * 2 - controls_space - button_space - gap * (count - 1)).max(0);
             let tab_width = if count > 0 && available >= count * min_tab_width {
                 (available / count).min(max_tab_width)
             } else {
@@ -365,7 +410,7 @@ impl TabBar {
                 });
             }
 
-            if current_x + new_tab_size <= stride - padding {
+            if current_x + new_tab_size <= stride - padding - controls_space {
                 let new_tab_rect = Rect {
                     x: current_x,
                     y: inset_y,
@@ -410,6 +455,267 @@ impl TabBar {
                     glyph_color,
                 );
             }
+
+            let controls_origin_x = stride - controls_space;
+            if controls_origin_x >= 0 {
+                let control_rects = [
+                    Rect {
+                        x: controls_origin_x,
+                        y: 0,
+                        w: control_size,
+                        h: strip_height,
+                    },
+                    Rect {
+                        x: controls_origin_x + control_size,
+                        y: 0,
+                        w: control_size,
+                        h: strip_height,
+                    },
+                    Rect {
+                        x: controls_origin_x + control_size * 2,
+                        y: 0,
+                        w: control_size,
+                        h: strip_height,
+                    },
+                ];
+                self.window_controls = Some(control_rects);
+
+                for rect in &control_rects[1..] {
+                    Self::fill_rect(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        Rect {
+                            x: rect.x,
+                            y: 0,
+                            w: 1,
+                            h: strip_height,
+                        },
+                        COLOR_SEPARATOR,
+                    );
+                }
+
+                let maximized = window.is_maximized();
+                let glyph = scaled(4.0).max(3);
+                let baseline = scaled(2.0).max(2);
+
+                for (index, rect) in control_rects.iter().enumerate() {
+                    let cx = rect.x + rect.w / 2;
+                    let cy = rect.y + rect.h / 2;
+                    let hovered = self.hover_control == Some(index);
+
+                    match index {
+                        0 => {
+                            if hovered {
+                                Self::fill_rect(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    *rect,
+                                    COLOR_TAB_HOVER,
+                                );
+                            }
+                            let color = if hovered { COLOR_TEXT } else { COLOR_TEXT_DIM };
+                            Self::draw_line(
+                                pixels,
+                                stride,
+                                canvas_height,
+                                cx - glyph,
+                                cy + baseline,
+                                cx + glyph,
+                                cy + baseline,
+                                color,
+                            );
+                        }
+                        1 => {
+                            if hovered {
+                                Self::fill_rect(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    *rect,
+                                    COLOR_TAB_HOVER,
+                                );
+                            }
+                            let color = if hovered { COLOR_TEXT } else { COLOR_TEXT_DIM };
+                            if maximized {
+                                let front_x0 = cx - glyph;
+                                let front_y0 = cy - glyph + baseline;
+                                let front_x1 = cx + glyph;
+                                let front_y1 = cy + glyph + baseline;
+                                let back_x0 = cx - glyph + baseline;
+                                let back_y0 = cy - glyph - baseline;
+                                let back_x1 = cx + glyph + baseline;
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    back_x0,
+                                    back_y0,
+                                    back_x1,
+                                    back_y0,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    back_x1,
+                                    back_y0,
+                                    back_x1,
+                                    cy + glyph - baseline,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    front_x0,
+                                    front_y0,
+                                    front_x1,
+                                    front_y0,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    front_x0,
+                                    front_y1,
+                                    front_x1,
+                                    front_y1,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    front_x0,
+                                    front_y0,
+                                    front_x0,
+                                    front_y1,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    front_x1,
+                                    front_y0,
+                                    front_x1,
+                                    front_y1,
+                                    color,
+                                );
+                            } else {
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    cx - glyph,
+                                    cy - glyph,
+                                    cx + glyph,
+                                    cy - glyph,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    cx - glyph,
+                                    cy + glyph,
+                                    cx + glyph,
+                                    cy + glyph,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    cx - glyph,
+                                    cy - glyph,
+                                    cx - glyph,
+                                    cy + glyph,
+                                    color,
+                                );
+                                Self::draw_line(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    cx + glyph,
+                                    cy - glyph,
+                                    cx + glyph,
+                                    cy + glyph,
+                                    color,
+                                );
+                            }
+                        }
+                        _ => {
+                            if hovered {
+                                Self::fill_rect(
+                                    pixels,
+                                    stride,
+                                    canvas_height,
+                                    *rect,
+                                    COLOR_WINDOW_CLOSE_BG,
+                                );
+                            }
+                            let color = if hovered { COLOR_WHITE } else { COLOR_TEXT_DIM };
+                            Self::draw_line(
+                                pixels,
+                                stride,
+                                canvas_height,
+                                cx - glyph,
+                                cy - glyph,
+                                cx + glyph,
+                                cy + glyph,
+                                color,
+                            );
+                            Self::draw_line(
+                                pixels,
+                                stride,
+                                canvas_height,
+                                cx - glyph,
+                                cy + glyph,
+                                cx + glyph,
+                                cy - glyph,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if !window.is_maximized() {
+            let border_color = if self.focused {
+                COLOR_BORDER_ACTIVE
+            } else {
+                COLOR_BORDER_INACTIVE
+            };
+            let max_x = stride - 1;
+            let max_y = canvas_height - 1;
+            Self::draw_line(pixels, stride, canvas_height, 0, 0, max_x, 0, border_color);
+            Self::draw_line(
+                pixels,
+                stride,
+                canvas_height,
+                0,
+                max_y,
+                max_x,
+                max_y,
+                border_color,
+            );
+            Self::draw_line(pixels, stride, canvas_height, 0, 0, 0, max_y, border_color);
+            Self::draw_line(
+                pixels,
+                stride,
+                canvas_height,
+                max_x,
+                0,
+                max_x,
+                max_y,
+                border_color,
+            );
         }
 
         if let Err(error) = buffer.present() {
