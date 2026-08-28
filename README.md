@@ -6,6 +6,8 @@ A lightweight, tabbed container for Windows that groups standalone application w
 
 Currently configured for **Alacritty**, but built on generic Win32 window management to support any native top-level application.
 
+![Uvez cycling through hosted tabs: winfetch, a repo listing, a system monitor, a network dashboard](assets/screenshots/demo.gif)
+
 ---
 
 ## What it does
@@ -17,6 +19,10 @@ Instead of relying on terminal-specific tab implementations or tiling window man
 - **Clean Alt+Tab / Taskbar integration**: Makes hosted guest windows owned by the container, so they group under Uvez and never appear as separate Taskbar or Alt+Tab entries.
 - **Software-rendered tab bar**: A minimal tab strip rendered via `softbuffer` and `fontdue` (Cascadia Code) that only redraws on state changes.
 - **MRU Tab Switching**: `Ctrl + Tab` toggles between your most recently used tabs first.
+
+The guests are real, unmodified applications — `winfetch` inside a hosted tab reports `Terminal: alacritty`:
+
+![winfetch running inside a hosted Alacritty tab](assets/screenshots/winfetch.png)
 
 ---
 
