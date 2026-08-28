@@ -1104,6 +1104,8 @@ impl ApplicationHandler for App {
                 self.bounds_dirty = false;
                 self.refocus_pending = false;
                 self.switch_requested.store(0, Ordering::Release);
+                self.new_tab_requested.store(0, Ordering::Release);
+                self.close_tab_requested.store(0, Ordering::Release);
                 self.close_all_managed_windows();
                 event_loop.exit();
             }

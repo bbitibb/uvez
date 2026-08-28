@@ -647,3 +647,51 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
         "timed out waiting for a visible window from PID {pid}"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::format_title;
+
+    #[test]
+    fn plain_title_passes_through() {
+        assert_eq!(format_title("My Terminal", "alacritty.exe"), "My Terminal");
+    }
+
+    #[test]
+    fn title_is_trimmed() {
+        assert_eq!(format_title("  Hello  ", "alacritty.exe"), "Hello");
+    }
+
+    #[test]
+    fn empty_title_falls_back_to_exe_stem() {
+        assert_eq!(format_title("", "alacritty.exe"), "alacritty");
+        assert_eq!(format_title("   ", "alacritty.exe"), "alacritty");
+    }
+
+    #[test]
+    fn exe_path_reduces_to_stem() {
+        assert_eq!(
+            format_title("C:\\tools\\alacritty.exe", "alacritty.exe"),
+            "alacritty"
+        );
+        assert_eq!(format_title("ALACRITTY.EXE", "alacritty.exe"), "ALACRITTY");
+    }
+
+    #[test]
+    fn absolute_non_exe_path_reduces_to_file_name() {
+        assert_eq!(
+            format_title("C:\\Users\\me\\Documents\\report.txt", "alacritty.exe"),
+            "report.txt"
+        );
+    }
+
+    #[test]
+    fn relative_paths_pass_through() {
+        assert_eq!(format_title("notes.txt", "alacritty.exe"), "notes.txt");
+    }
+
+    #[test]
+    fn unc_paths_reduce_to_file_name() {
+        assert_eq!(format_title("\\\\server\\share\\app.exe", "x.exe"), "app");
+    }
+}

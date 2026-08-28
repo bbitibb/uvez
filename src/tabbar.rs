@@ -233,6 +233,7 @@ impl TabBar {
             );
             if let Err(error) = resize {
                 debug_log!("Could not resize the tab bar surface: {error}");
+                self.dirty = true;
                 return;
             }
             self.buffer_width = width;
@@ -852,5 +853,43 @@ impl TabBar {
 
             pixels[(y * stride + x) as usize] = color;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rect, blend_pixel};
+
+    #[test]
+    fn blend_coverage_zero_returns_background() {
+        assert_eq!(blend_pixel(0x00123456, 0x00ABCDEF, 0), 0x00123456);
+    }
+
+    #[test]
+    fn blend_coverage_max_returns_foreground() {
+        assert_eq!(blend_pixel(0x00123456, 0x00ABCDEF, 255), 0x00ABCDEF);
+    }
+
+    #[test]
+    fn blend_midpoint_is_rounded_per_channel() {
+        assert_eq!(blend_pixel(0x00000000, 0x00FFFFFF, 127), 0x007F7F7F);
+        assert_eq!(blend_pixel(0x00FF0000, 0x000000FF, 128), 0x007F0080);
+    }
+
+    #[test]
+    fn rect_contains_left_and_top_edges_but_not_right_and_bottom() {
+        let rect = Rect {
+            x: 10,
+            y: 20,
+            w: 30,
+            h: 40,
+        };
+
+        assert!(rect.contains(10, 20));
+        assert!(rect.contains(39, 59));
+        assert!(!rect.contains(40, 20));
+        assert!(!rect.contains(10, 60));
+        assert!(!rect.contains(9, 20));
+        assert!(!rect.contains(10, 19));
     }
 }
