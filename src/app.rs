@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::debug_log;
 use crate::guest::{self, ManagedWindow, WindowBounds};
 use crate::host_events::{
     self, HOST_SUBCLASS_ID, HOST_SUBCLASS_PROC, NativeHostEvents, release_subclass_reference,
@@ -192,9 +193,12 @@ impl App {
         }
 
         let managed = &self.managed_windows[index];
-        println!(
+        debug_log!(
             "Managing {} (PID {}, HWND {:?}): {}",
-            managed.exe_name, managed.pid, managed.hwnd, managed.title
+            managed.exe_name,
+            managed.pid,
+            managed.hwnd,
+            managed.title
         );
         self.mark_dirty();
         Ok(index)
@@ -257,7 +261,7 @@ impl App {
         {
             self.host_subclass_reference = None;
         } else {
-            eprintln!("Could not remove the Uvez host window subclass safely");
+            debug_log!("Could not remove the Uvez host window subclass safely");
         }
     }
 
@@ -310,7 +314,7 @@ impl App {
 
         self.lift_release_attempts = self.lift_release_attempts.saturating_add(1);
         if self.lift_release_attempts == 1 {
-            eprintln!("Could not restore the managed window's normal Z-order; retrying");
+            debug_log!("Could not restore the managed window's normal Z-order; retrying");
         }
 
         if self.lift_release_attempts <= 3 {
@@ -318,7 +322,7 @@ impl App {
                 window.request_redraw();
             }
         } else if self.lift_release_attempts == 4 {
-            eprintln!("Managed window Z-order restoration still failed after three retries");
+            debug_log!("Managed window Z-order restoration still failed after three retries");
         }
 
         false
@@ -346,7 +350,7 @@ impl App {
         };
 
         if let Err(error) = result {
-            eprintln!(
+            debug_log!(
                 "Could not raise {} above the Uvez host: {error}",
                 managed.title
             );
@@ -371,7 +375,7 @@ impl App {
         };
 
         if let Err(error) = result {
-            eprintln!("Could not raise the Uvez host: {error}");
+            debug_log!("Could not raise the Uvez host: {error}");
         }
     }
 
@@ -382,12 +386,12 @@ impl App {
 
         let managed = &self.managed_windows[active];
         if !managed.is_open() {
-            eprintln!("Managed HWND {:?} is no longer valid", managed.hwnd);
+            debug_log!("Managed HWND {:?} is no longer valid", managed.hwnd);
             return false;
         }
 
         if let Err(error) = managed.position(bounds) {
-            eprintln!("Could not position {}: {error}", managed.title);
+            debug_log!("Could not position {}: {error}", managed.title);
             return false;
         }
 
@@ -446,7 +450,7 @@ impl App {
 
         {
             let managed = &self.managed_windows[index];
-            println!(
+            debug_log!(
                 "Activating tab {}: {} (PID {}, HWND {:?})",
                 index + 1,
                 managed.title,
@@ -625,7 +629,7 @@ impl App {
 
         for managed in &mut self.managed_windows {
             if let Err(error) = managed.restore_native_state() {
-                eprintln!("Could not release {}: {error}", managed.title);
+                debug_log!("Could not release {}: {error}", managed.title);
             }
         }
 
@@ -639,7 +643,7 @@ impl App {
 
         for managed in &mut self.managed_windows {
             if let Err(error) = managed.restore_native_state() {
-                eprintln!("Could not restore {} while exiting: {error}", managed.title);
+                debug_log!("Could not restore {} while exiting: {error}", managed.title);
             }
         }
     }
@@ -659,7 +663,7 @@ impl App {
                 let index = match self.add_managed_window(discovered.into_managed_window()) {
                     Ok(index) => index,
                     Err(error) => {
-                        eprintln!("Could not manage new window: {error}");
+                        debug_log!("Could not manage new window: {error}");
                         if startup && self.active.is_none() {
                             self.fail_startup(format!(
                                 "Uvez could not manage the new window: {error}"
@@ -676,7 +680,7 @@ impl App {
                 }
             }
             Err(error) => {
-                eprintln!("Could not create managed window: {error}");
+                debug_log!("Could not create managed window: {error}");
                 if startup && self.active.is_none() {
                     self.fail_startup(format!(
                         "Could not start the guest application: {error}\n\nMake sure Alacritty is installed and available on PATH, then start Uvez again."
@@ -715,7 +719,7 @@ impl App {
                 )
             } {
                 Ok(()) => self.hotkey_switch_registered = true,
-                Err(error) => eprintln!("Could not register Ctrl+Tab: {error}"),
+                Err(error) => debug_log!("Could not register Ctrl+Tab: {error}"),
             }
         }
 
@@ -729,7 +733,7 @@ impl App {
                 )
             } {
                 Ok(()) => self.hotkey_new_tab_registered = true,
-                Err(error) => eprintln!("Could not register Ctrl+T: {error}"),
+                Err(error) => debug_log!("Could not register Ctrl+T: {error}"),
             }
         }
 
@@ -743,7 +747,7 @@ impl App {
                 )
             } {
                 Ok(()) => self.hotkey_close_tab_registered = true,
-                Err(error) => eprintln!("Could not register Ctrl + W: {error}"),
+                Err(error) => debug_log!("Could not register Ctrl + W: {error}"),
             }
         }
     }
@@ -850,7 +854,7 @@ impl App {
             .as_ref()
             .map(|tab_bar| tab_bar.hit_test(x, y))
             .unwrap_or(Hit::None);
-        println!("Strip click {button:?} at ({x}, {y}): {hit:?}");
+        debug_log!("Strip click {button:?} at ({x}, {y}): {hit:?}");
 
         match (button, hit) {
             (MouseButton::Left, Hit::NewTab) => {
@@ -1033,7 +1037,7 @@ impl ApplicationHandler for App {
         self.window = Some(Arc::new(event_loop.create_window(attributes).unwrap()));
 
         if let Err(error) = self.install_host_subclass() {
-            eprintln!("Could not initialize native host synchronization: {error}");
+            debug_log!("Could not initialize native host synchronization: {error}");
             self.fail_startup(format!(
                 "Uvez could not initialize native host synchronization: {error}"
             ));
@@ -1059,7 +1063,7 @@ impl ApplicationHandler for App {
         match TabBar::new(self.window.as_ref().expect("host window exists")) {
             Ok(tab_bar) => self.tab_bar = Some(tab_bar),
             Err(error) => {
-                eprintln!("Could not initialize the tab bar renderer: {error}");
+                debug_log!("Could not initialize the tab bar renderer: {error}");
                 self.fail_startup(format!(
                     "Uvez could not initialize the tab bar renderer: {error}"
                 ));
@@ -1073,7 +1077,7 @@ impl ApplicationHandler for App {
             self.spawn_new_tab();
         }
 
-        println!(
+        debug_log!(
             "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab"
         );
         self.update_hotkey_registration();

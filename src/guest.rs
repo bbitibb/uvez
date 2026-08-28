@@ -1,3 +1,4 @@
+use crate::debug_log;
 use std::ffi::c_void;
 use std::panic;
 use std::path::Path;
@@ -212,7 +213,7 @@ impl ManagedWindow {
 
         if let Err(error) = apply_result {
             if let Err(restore_error) = self.restore_native_state() {
-                eprintln!("Could not roll back {}: {restore_error}", self.title);
+                debug_log!("Could not roll back {}: {restore_error}", self.title);
             }
             return Err(error);
         }
@@ -354,17 +355,18 @@ impl ManagedWindow {
 
         unsafe {
             if let Err(error) = BringWindowToTop(self.hwnd) {
-                eprintln!("Could not raise {}: {error}", self.title);
+                debug_log!("Could not raise {}: {error}", self.title);
             }
 
             if !SetForegroundWindow(self.hwnd).as_bool() {
-                eprintln!("Windows refused to foreground {}", self.title);
+                debug_log!("Windows refused to foreground {}", self.title);
             }
 
             let foreground = GetForegroundWindow();
-            println!(
+            debug_log!(
                 "Foreground HWND after activation: {:?} (target {:?})",
-                foreground, self.hwnd
+                foreground,
+                self.hwnd
             );
         }
     }
@@ -378,7 +380,7 @@ impl ManagedWindow {
 
         unsafe {
             if let Err(error) = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) {
-                eprintln!("Could not close {}: {error}", self.title);
+                debug_log!("Could not close {}: {error}", self.title);
             }
         }
     }

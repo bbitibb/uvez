@@ -3,6 +3,7 @@
 mod app;
 mod guest;
 mod host_events;
+mod logging;
 mod tabbar;
 
 use std::sync::{

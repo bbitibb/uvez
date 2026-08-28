@@ -1,3 +1,4 @@
+use crate::debug_log;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -231,7 +232,7 @@ impl TabBar {
                 NonZeroU32::new(height).expect("height is nonzero"),
             );
             if let Err(error) = resize {
-                eprintln!("Could not resize the tab bar surface: {error}");
+                debug_log!("Could not resize the tab bar surface: {error}");
                 return;
             }
             self.buffer_width = width;
@@ -719,7 +720,7 @@ impl TabBar {
         }
 
         if let Err(error) = buffer.present() {
-            eprintln!("Could not present the tab bar frame: {error}");
+            debug_log!("Could not present the tab bar frame: {error}");
             self.dirty = true;
         }
     }

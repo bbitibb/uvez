@@ -25,7 +25,7 @@ Instead of relying on terminal-specific tab implementations or tiling window man
 | **New tab** | `Ctrl + T` or `Left Click` on `+` |
 | **Switch to recent tab (MRU)** | `Ctrl + Tab` |
 | **Switch tab** | `Left Click` on tab |
-| **Close tab** | `Middle Click` on tab or `Left Click` on `×` |
+| **Close tab** | `Ctrl + Shift + W`, `Middle Click` on tab or `Left Click` on `×` |
 | **Minimize / Maximize / Close** | Buttons in the top-right of the tab strip |
 | **Move window** | Drag the empty tab strip |
 | **Maximize / restore** | Double-click the empty tab strip |
