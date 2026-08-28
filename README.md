@@ -47,6 +47,18 @@ cargo run --release
 
 ---
 
+## Diagnostics
+
+Uvez is a GUI-subsystem application and prints nothing by default.
+
+- **Development builds** (`cargo run`) always log to stderr.
+- **Release builds**: set the `UVEZ_DEBUG` environment variable to write
+  a session log to `%TEMP%\uvez-debug.log` (fresh on every launch).
+
+```powershell
+$env:UVEZ_DEBUG = "1"; .\target\release\uvez.exe
+When reporting a bug, attach that log file.
+
 ## Roadmap
 
 - [ ] TOML configuration file for custom app launch profiles and args
