@@ -1,5 +1,7 @@
 # uvez
 
+[![CI](https://github.com/bbitibb/uvez/actions/workflows/ci.yml/badge.svg)](https://github.com/bbitibb/uvez/actions/workflows/ci.yml)
+
 A lightweight, tabbed container for Windows that groups standalone application windows into a single window with a native-feeling tab bar.
 
 Currently configured for **Alacritty**, but built on generic Win32 window management to support any native top-level application.
@@ -57,6 +59,8 @@ Uvez is a GUI-subsystem application and prints nothing by default.
 
 ```powershell
 $env:UVEZ_DEBUG = "1"; .\target\release\uvez.exe
+```
+
 When reporting a bug, attach that log file.
 
 ## Roadmap
