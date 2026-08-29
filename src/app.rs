@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey,
-    UnregisterHotKey, VK_CONTROL, VK_T, VK_TAB, VK_W,
+    ReleaseCapture, SetCapture, UnregisterHotKey, VK_CONTROL, VK_LBUTTON, VK_T, VK_TAB, VK_W,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -42,10 +42,18 @@ pub(crate) const CLOSE_TAB_HOTKEY_ID: i32 = 3;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
+const TAB_DRAG_THRESHOLD_LOGICAL: f64 = 6.0;
 
 struct CycleSession {
     order: Vec<usize>,
     step: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TabPress {
+    guest_index: usize,
+    x: i32,
+    y: i32,
 }
 
 fn show_error_box(message: &str) {
@@ -91,6 +99,30 @@ fn apply_dwm_border_color(hwnd: HWND, focused: bool) {
     }
 }
 
+fn tab_sequence_for_order(display_order: &[usize], open: &[usize], total: usize) -> Vec<usize> {
+    let mut sequence = Vec::new();
+
+    for &index in display_order {
+        if open.contains(&index) && !sequence.contains(&index) {
+            sequence.push(index);
+        }
+    }
+
+    for &index in open {
+        if !sequence.contains(&index) {
+            sequence.push(index);
+        }
+    }
+
+    for index in 0..total {
+        if !sequence.contains(&index) {
+            sequence.push(index);
+        }
+    }
+
+    sequence
+}
+
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
@@ -115,6 +147,7 @@ pub(crate) struct App {
     tab_bar: Option<TabBar>,
     cursor_pos: Option<(i32, i32)>,
     last_strip_click: Option<(Instant, i32, i32)>,
+    tab_press: Option<TabPress>,
     dwm_border_focused: Option<bool>,
     last_housekeeping: Instant,
 }
@@ -151,6 +184,7 @@ impl App {
             tab_bar: None,
             cursor_pos: None,
             last_strip_click: None,
+            tab_press: None,
             dwm_border_focused: None,
             last_housekeeping: Instant::now(),
         }
@@ -508,7 +542,16 @@ impl App {
         (state as u16 & KEY_PRESSED) != 0
     }
 
+    fn left_button_held() -> bool {
+        let state = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) };
+        (state as u16 & KEY_PRESSED) != 0
+    }
+
     fn begin_or_advance_tab_cycle(&mut self) {
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            self.cancel_tab_drag();
+        }
+
         if self.cycle.is_none() {
             self.start_tab_cycle();
         } else if let Some(session) = self.cycle.as_mut() {
@@ -603,6 +646,10 @@ impl App {
     }
 
     fn close_active_window(&mut self) {
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            self.cancel_tab_drag();
+        }
+
         let Some(active) = self.active else {
             return;
         };
@@ -812,6 +859,10 @@ impl App {
     }
 
     fn update_hover(&mut self) {
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            return;
+        }
+
         let Some((x, y)) = self.cursor_pos else {
             return;
         };
@@ -845,6 +896,12 @@ impl App {
             return;
         }
 
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            return;
+        }
+
+        self.tab_press = None;
+
         let Some((x, y)) = self.cursor_pos else {
             return;
         };
@@ -875,6 +932,7 @@ impl App {
                 } else {
                     self.activate_window(guest_index);
                 }
+                self.tab_press = Some(TabPress { guest_index, x, y });
             }
             (MouseButton::Left, Hit::Close(guest_index))
             | (MouseButton::Middle, Hit::Tab(guest_index)) => {
@@ -927,6 +985,128 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn promote_tab_press(&mut self, x: i32, y: i32) {
+        let Some(press) = self.tab_press else {
+            return;
+        };
+
+        let threshold = (TAB_DRAG_THRESHOLD_LOGICAL * self.scale_factor()).round() as i32;
+        let threshold = threshold.max(1);
+        if (x - press.x).abs() < threshold && (y - press.y).abs() < threshold {
+            return;
+        }
+
+        self.tab_press = None;
+        if !Self::left_button_held() {
+            return;
+        }
+
+        let host_hwnd = self.host_hwnd();
+        let Some(tab_bar) = self.tab_bar.as_mut() else {
+            return;
+        };
+        if tab_bar.begin_drag(press.guest_index, press.x)
+            && let Some(hwnd) = host_hwnd
+        {
+            unsafe {
+                let _ = SetCapture(hwnd);
+            }
+            debug_log!("Dragging tab {}", press.guest_index + 1);
+        }
+    }
+
+    fn handle_strip_release(&mut self, button: MouseButton) {
+        self.tab_press = None;
+        if button != MouseButton::Left {
+            return;
+        }
+        if !self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            return;
+        }
+        self.finish_tab_drag();
+    }
+
+    fn finish_tab_drag(&mut self) {
+        let cursor_x = self.cursor_pos.map(|(x, _)| x);
+        let order = self
+            .tab_bar
+            .as_mut()
+            .and_then(|tab_bar| tab_bar.finish_drag(cursor_x));
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if let Some(order) = order {
+            self.apply_tab_order(order);
+        }
+        self.update_hover();
+    }
+
+    fn cancel_tab_drag(&mut self) {
+        self.tab_press = None;
+        if let Some(tab_bar) = self.tab_bar.as_mut() {
+            tab_bar.cancel_drag();
+        }
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.update_hover();
+    }
+
+    fn apply_tab_order(&mut self, display_order: Vec<usize>) {
+        let original_len = self.managed_windows.len();
+        if original_len < 2 {
+            return;
+        }
+
+        let open: Vec<usize> = (0..original_len)
+            .filter(|&index| self.managed_windows[index].is_open())
+            .collect();
+        let sequence = tab_sequence_for_order(&display_order, &open, original_len);
+
+        let unchanged = sequence
+            .iter()
+            .enumerate()
+            .all(|(position, &index)| position == index);
+        if unchanged {
+            return;
+        }
+
+        let mut new_index_of_old = vec![usize::MAX; original_len];
+        for (position, &index) in sequence.iter().enumerate() {
+            new_index_of_old[index] = position;
+        }
+
+        let old_windows = std::mem::take(&mut self.managed_windows);
+        let mut slots: Vec<Option<ManagedWindow>> = old_windows.into_iter().map(Some).collect();
+        self.managed_windows = sequence
+            .iter()
+            .map(|&index| slots[index].take().expect("tab sequence is a permutation"))
+            .collect();
+
+        if let Some(active) = self.active {
+            self.active = Some(new_index_of_old[active]);
+        }
+
+        self.mru.retain(|&index| index < original_len);
+        self.mru = self
+            .mru
+            .iter()
+            .map(|&index| new_index_of_old[index])
+            .collect();
+
+        if let Some(session) = &mut self.cycle {
+            session.order.retain(|&index| index < original_len);
+            session.order = session
+                .order
+                .iter()
+                .map(|&index| new_index_of_old[index])
+                .collect();
+        }
+
+        debug_log!("Reordered tabs: {sequence:?}");
+        self.mark_dirty();
     }
 
     fn prune_dead_guests(&mut self) -> bool {
@@ -1126,6 +1306,11 @@ impl ApplicationHandler for App {
                 let _ = self.reconcile_move_lift();
                 if !self.group_is_foreground() {
                     self.refocus_pending = false;
+                    if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging)
+                        || self.tab_press.is_some()
+                    {
+                        self.cancel_tab_drag();
+                    }
                 }
                 self.update_hotkey_registration();
                 self.sync_tab_bar_focus();
@@ -1138,6 +1323,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.cancel_tab_drag();
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.update_scale(scale_factor);
                 }
@@ -1163,22 +1349,37 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some((position.x as i32, position.y as i32));
-                self.update_hover();
+                let x = position.x as i32;
+                let y = position.y as i32;
+                self.cursor_pos = Some((x, y));
+                self.promote_tab_press(x, y);
+
+                if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+                    if let Some(tab_bar) = self.tab_bar.as_mut()
+                        && tab_bar.update_drag(x)
+                    {
+                        self.mark_dirty();
+                    }
+                } else {
+                    self.update_hover();
+                }
             }
 
             WindowEvent::CursorLeft { .. } => {
+                if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+                    return;
+                }
+
                 self.cursor_pos = None;
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.clear_hover();
                 }
             }
 
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => self.handle_strip_click(button),
+            WindowEvent::MouseInput { state, button, .. } => match state {
+                ElementState::Pressed => self.handle_strip_click(button),
+                ElementState::Released => self.handle_strip_release(button),
+            },
 
             _ => {}
         }
@@ -1277,5 +1478,50 @@ impl ApplicationHandler for App {
         self.release_managed_windows();
         self.unregister_hotkeys();
         self.remove_host_subclass();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_sequence_for_order;
+
+    #[test]
+    fn identity_order_passes_through() {
+        let open = [0, 1, 2];
+        assert_eq!(tab_sequence_for_order(&[0, 1, 2], &open, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn display_order_reorders_open_guests() {
+        let open = [0, 1, 2];
+        assert_eq!(tab_sequence_for_order(&[2, 0, 1], &open, 3), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn partial_display_order_appends_missing_open_guests() {
+        let open = [0, 1, 2];
+        assert_eq!(tab_sequence_for_order(&[2], &open, 3), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn unknown_and_duplicate_indices_are_dropped() {
+        let open = [0, 1, 2];
+        assert_eq!(
+            tab_sequence_for_order(&[1, 1, 7, 0], &open, 3),
+            vec![1, 0, 2]
+        );
+    }
+
+    #[test]
+    fn closed_guests_keep_relative_order_after_open_ones() {
+        let open = [0, 2];
+        assert_eq!(tab_sequence_for_order(&[2, 0], &open, 3), vec![2, 0, 1]);
+        assert_eq!(tab_sequence_for_order(&[], &open, 3), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn out_of_range_indices_are_ignored() {
+        let open = [0, 1];
+        assert_eq!(tab_sequence_for_order(&[1, 0], &open, 2), vec![1, 0]);
     }
 }

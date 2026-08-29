@@ -64,6 +64,26 @@ struct TabSlot {
     guest_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DragState {
+    guest_index: usize,
+    grab_offset: i32,
+    cursor_x: i32,
+    padding: i32,
+    step: i32,
+    max_slot: i32,
+}
+
+fn drag_insertion(desired_left: i32, padding: i32, step: i32, max_slot: i32) -> (i32, usize) {
+    if step <= 0 || max_slot <= 0 {
+        return (padding, 0);
+    }
+
+    let clamped = desired_left.clamp(padding, padding + step * max_slot);
+    let insertion = (((clamped - padding) + step / 2) / step).clamp(0, max_slot);
+    (clamped, insertion as usize)
+}
+
 pub(crate) struct TabBar {
     _context: Context<Arc<Window>>,
     surface: Surface<Arc<Window>, Arc<Window>>,
@@ -81,6 +101,8 @@ pub(crate) struct TabBar {
     hover_control: Option<usize>,
     focused: bool,
     dirty: bool,
+    display_order: Vec<usize>,
+    drag: Option<DragState>,
 }
 
 fn blend_pixel(background: u32, foreground: u32, coverage: u32) -> u32 {
@@ -128,6 +150,8 @@ impl TabBar {
             hover_control: None,
             focused: false,
             dirty: true,
+            display_order: Vec::new(),
+            drag: None,
         })
     }
 
@@ -184,6 +208,83 @@ impl TabBar {
 
     pub(crate) fn clear_hover(&mut self) {
         self.set_hover(Hit::None);
+    }
+
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(crate) fn begin_drag(&mut self, guest_index: usize, press_x: i32) -> bool {
+        if self.drag.is_some() || self.layout.len() < 2 {
+            return false;
+        }
+
+        let Some(slot) = self
+            .layout
+            .iter()
+            .find(|slot| slot.guest_index == guest_index)
+        else {
+            return false;
+        };
+
+        self.drag = Some(DragState {
+            guest_index,
+            grab_offset: press_x - slot.tab.x,
+            cursor_x: press_x,
+            padding: 0,
+            step: 0,
+            max_slot: 0,
+        });
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn update_drag(&mut self, cursor_x: i32) -> bool {
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+
+        if drag.cursor_x == cursor_x {
+            return false;
+        }
+
+        drag.cursor_x = cursor_x;
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn finish_drag(&mut self, cursor_x: Option<i32>) -> Option<Vec<usize>> {
+        let drag = self.drag.take()?;
+
+        if let Some(cursor_x) = cursor_x
+            && drag.step > 0
+            && drag.max_slot > 0
+        {
+            let (_, insertion) = drag_insertion(
+                cursor_x - drag.grab_offset,
+                drag.padding,
+                drag.step,
+                drag.max_slot,
+            );
+            let mut order: Vec<usize> = self
+                .display_order
+                .iter()
+                .copied()
+                .filter(|&guest| guest != drag.guest_index)
+                .collect();
+            order.insert(insertion.min(order.len()), drag.guest_index);
+            self.display_order = order;
+        }
+
+        self.dirty = true;
+        Some(std::mem::take(&mut self.display_order))
+    }
+
+    pub(crate) fn cancel_drag(&mut self) {
+        if self.drag.take().is_some() {
+            self.dirty = true;
+        }
+        self.display_order.clear();
     }
 
     pub(crate) fn hit_test(&self, x: i32, y: i32) -> Hit {
@@ -289,11 +390,71 @@ impl TabBar {
                 min_tab_width
             };
 
-            let mut current_x = padding;
+            let step = tab_width + gap;
+            let max_slot = (tabs.len() as i32).saturating_sub(1);
 
-            for (slot, model) in tabs.iter().enumerate() {
-                let tab_x = padding + slot as i32 * (tab_width + gap);
-                current_x = tab_x + tab_width + gap;
+            let mut order: Vec<usize> = self
+                .display_order
+                .iter()
+                .copied()
+                .filter(|&guest| tabs.iter().any(|model| model.guest_index == guest))
+                .collect();
+            for model in tabs {
+                if !order.contains(&model.guest_index) {
+                    order.push(model.guest_index);
+                }
+            }
+            self.display_order = order.clone();
+
+            if let Some(drag) = self.drag.as_mut() {
+                drag.padding = padding;
+                drag.step = step;
+                drag.max_slot = max_slot;
+            }
+
+            let drag_state = self.drag;
+            let mut drag_left: Option<i32> = None;
+            if let Some(drag) = drag_state {
+                if order.len() < 2 || !order.contains(&drag.guest_index) {
+                    self.drag = None;
+                } else if let Some(position) =
+                    order.iter().position(|&guest| guest == drag.guest_index)
+                {
+                    let (clamped, insertion) =
+                        drag_insertion(drag.cursor_x - drag.grab_offset, padding, step, max_slot);
+                    order.remove(position);
+                    order.insert(insertion.min(order.len()), drag.guest_index);
+                    self.display_order = order.clone();
+                    drag_left = Some(clamped);
+                }
+            }
+
+            let mut draw_sequence: Vec<(usize, usize)> = order
+                .iter()
+                .enumerate()
+                .map(|(slot, &guest)| (slot, guest))
+                .collect();
+            if let Some(drag) = drag_state
+                && let Some(position) = draw_sequence
+                    .iter()
+                    .position(|&(_, guest)| guest == drag.guest_index)
+            {
+                let entry = draw_sequence.remove(position);
+                draw_sequence.push(entry);
+            }
+
+            for (slot, guest) in draw_sequence {
+                let Some(model) = tabs.iter().find(|model| model.guest_index == guest) else {
+                    continue;
+                };
+                let slot_x = padding + slot as i32 * step;
+                let floating =
+                    drag_left.is_some() && drag_state.is_some_and(|drag| drag.guest_index == guest);
+                let tab_x = if floating {
+                    drag_left.unwrap_or(slot_x)
+                } else {
+                    slot_x
+                };
                 let tab_rect = Rect {
                     x: tab_x,
                     y: inset_y,
@@ -308,7 +469,7 @@ impl TabBar {
                     h: close_side,
                 };
 
-                let hovered = self.hover_tab == Some(model.guest_index);
+                let hovered = !floating && self.hover_tab == Some(model.guest_index);
                 let background = if model.active {
                     COLOR_TAB_ACTIVE
                 } else if hovered {
@@ -334,7 +495,7 @@ impl TabBar {
                     );
                 }
 
-                if slot > 0 {
+                if !floating && slot > 0 {
                     let separator_x = tab_rect.x - ((gap + 1) / 2).max(1);
                     Self::fill_rect(
                         pixels,
@@ -370,10 +531,11 @@ impl TabBar {
                     text_color,
                 );
 
-                if self.hover_close == Some(model.guest_index) {
+                let close_hovered = !floating && self.hover_close == Some(model.guest_index);
+                if close_hovered {
                     Self::fill_rect(pixels, stride, canvas_height, close_rect, COLOR_CLOSE_BG);
                 }
-                let glyph_color = if self.hover_close == Some(model.guest_index) {
+                let glyph_color = if close_hovered {
                     COLOR_CLOSE_GLYPH
                 } else {
                     COLOR_TEXT_DIM
@@ -405,13 +567,16 @@ impl TabBar {
                     glyph_color,
                 );
 
-                self.layout.push(TabSlot {
-                    tab: tab_rect,
-                    close: close_rect,
-                    guest_index: model.guest_index,
-                });
+                if !floating {
+                    self.layout.push(TabSlot {
+                        tab: tab_rect,
+                        close: close_rect,
+                        guest_index: model.guest_index,
+                    });
+                }
             }
 
+            let current_x = padding + order.len() as i32 * step;
             if current_x + new_tab_size <= stride - padding - controls_space {
                 let new_tab_rect = Rect {
                     x: current_x,
@@ -858,7 +1023,7 @@ impl TabBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, blend_pixel};
+    use super::{Rect, blend_pixel, drag_insertion};
 
     #[test]
     fn blend_coverage_zero_returns_background() {
@@ -891,5 +1056,32 @@ mod tests {
         assert!(!rect.contains(10, 60));
         assert!(!rect.contains(9, 20));
         assert!(!rect.contains(10, 19));
+    }
+
+    #[test]
+    fn insertion_index_tracks_slot_positions() {
+        assert_eq!(drag_insertion(10, 10, 100, 3), (10, 0));
+        assert_eq!(drag_insertion(110, 10, 100, 3), (110, 1));
+        assert_eq!(drag_insertion(210, 10, 100, 3), (210, 2));
+        assert_eq!(drag_insertion(310, 10, 100, 3), (310, 3));
+    }
+
+    #[test]
+    fn insertion_index_snaps_past_slot_midpoint() {
+        assert_eq!(drag_insertion(59, 10, 100, 3).1, 0);
+        assert_eq!(drag_insertion(60, 10, 100, 3).1, 1);
+        assert_eq!(drag_insertion(160, 10, 100, 3).1, 2);
+    }
+
+    #[test]
+    fn insertion_index_clamps_to_first_and_last_slot() {
+        assert_eq!(drag_insertion(-500, 10, 100, 3), (10, 0));
+        assert_eq!(drag_insertion(10_000, 10, 100, 3), (310, 3));
+    }
+
+    #[test]
+    fn insertion_index_is_safe_for_degenerate_geometry() {
+        assert_eq!(drag_insertion(50, 10, 0, 3), (10, 0));
+        assert_eq!(drag_insertion(50, 10, 100, 0), (10, 0));
     }
 }
