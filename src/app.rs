@@ -11,6 +11,7 @@ use crate::guest::{self, ManagedWindow, WindowBounds};
 use crate::host_events::{
     self, HOST_SUBCLASS_ID, HOST_SUBCLASS_PROC, NativeHostEvents, release_subclass_reference,
 };
+use crate::icon;
 use crate::tabbar::{
     COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE, Hit, TAB_BAR_HEIGHT_LOGICAL, TAB_BORDER_WIDTH,
     TabBar, TabModel,
@@ -33,6 +34,7 @@ use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
@@ -1213,7 +1215,10 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let attributes = Window::default_attributes().with_title("Uvez");
+        let mut attributes = Window::default_attributes()
+            .with_title("Uvez")
+            .with_window_icon(icon::window_icon());
+        attributes = attributes.with_taskbar_icon(icon::taskbar_icon());
         self.window = Some(Arc::new(event_loop.create_window(attributes).unwrap()));
 
         if let Err(error) = self.install_host_subclass() {

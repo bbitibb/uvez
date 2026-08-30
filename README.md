@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/logo.svg" width="96" alt="Uvez logo" />
+</div>
+
 # uvez
 
 [![CI](https://github.com/bbitibb/uvez/actions/workflows/ci.yml/badge.svg)](https://github.com/bbitibb/uvez/actions/workflows/ci.yml)

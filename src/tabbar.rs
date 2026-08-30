@@ -1,4 +1,5 @@
 use crate::debug_log;
+use crate::icon;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -69,9 +70,15 @@ struct DragState {
     guest_index: usize,
     grab_offset: i32,
     cursor_x: i32,
-    padding: i32,
+    origin_x: i32,
     step: i32,
     max_slot: i32,
+}
+
+struct LogoBitmap {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 fn drag_insertion(desired_left: i32, padding: i32, step: i32, max_slot: i32) -> (i32, usize) {
@@ -103,6 +110,7 @@ pub(crate) struct TabBar {
     dirty: bool,
     display_order: Vec<usize>,
     drag: Option<DragState>,
+    logo: Option<LogoBitmap>,
 }
 
 fn blend_pixel(background: u32, foreground: u32, coverage: u32) -> u32 {
@@ -152,6 +160,11 @@ impl TabBar {
             dirty: true,
             display_order: Vec::new(),
             drag: None,
+            logo: icon::strip_frame().map(|(rgba, width, height)| LogoBitmap {
+                rgba,
+                width,
+                height,
+            }),
         })
     }
 
@@ -231,7 +244,7 @@ impl TabBar {
             guest_index,
             grab_offset: press_x - slot.tab.x,
             cursor_x: press_x,
-            padding: 0,
+            origin_x: 0,
             step: 0,
             max_slot: 0,
         });
@@ -262,7 +275,7 @@ impl TabBar {
         {
             let (_, insertion) = drag_insertion(
                 cursor_x - drag.grab_offset,
-                drag.padding,
+                drag.origin_x,
                 drag.step,
                 drag.max_slot,
             );
@@ -382,8 +395,20 @@ impl TabBar {
             let tab_height = strip_height - inset_y * 2;
             let new_tab_size = tab_height;
             let button_space = new_tab_size + gap;
-            let available =
-                (stride - padding * 2 - controls_space - button_space - gap * (count - 1)).max(0);
+            let icon_px = scaled(22.0).max(14);
+            let icon_space = if self.logo.is_some() {
+                icon_px + gap
+            } else {
+                0
+            };
+            let origin_x = padding + icon_space;
+            let available = (stride
+                - padding * 2
+                - icon_space
+                - controls_space
+                - button_space
+                - gap * (count - 1))
+                .max(0);
             let tab_width = if count > 0 && available >= count * min_tab_width {
                 (available / count).min(max_tab_width)
             } else {
@@ -407,7 +432,7 @@ impl TabBar {
             self.display_order = order.clone();
 
             if let Some(drag) = self.drag.as_mut() {
-                drag.padding = padding;
+                drag.origin_x = origin_x;
                 drag.step = step;
                 drag.max_slot = max_slot;
             }
@@ -421,7 +446,7 @@ impl TabBar {
                     order.iter().position(|&guest| guest == drag.guest_index)
                 {
                     let (clamped, insertion) =
-                        drag_insertion(drag.cursor_x - drag.grab_offset, padding, step, max_slot);
+                        drag_insertion(drag.cursor_x - drag.grab_offset, origin_x, step, max_slot);
                     order.remove(position);
                     order.insert(insertion.min(order.len()), drag.guest_index);
                     self.display_order = order.clone();
@@ -443,11 +468,24 @@ impl TabBar {
                 draw_sequence.push(entry);
             }
 
+            if let Some(logo) = &self.logo {
+                let icon_y = (strip_height - icon_px) / 2;
+                Self::blit_bitmap(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    logo,
+                    padding,
+                    icon_y,
+                    icon_px,
+                );
+            }
+
             for (slot, guest) in draw_sequence {
                 let Some(model) = tabs.iter().find(|model| model.guest_index == guest) else {
                     continue;
                 };
-                let slot_x = padding + slot as i32 * step;
+                let slot_x = origin_x + slot as i32 * step;
                 let floating =
                     drag_left.is_some() && drag_state.is_some_and(|drag| drag.guest_index == guest);
                 let tab_x = if floating {
@@ -576,7 +614,7 @@ impl TabBar {
                 }
             }
 
-            let current_x = padding + order.len() as i32 * step;
+            let current_x = origin_x + order.len() as i32 * step;
             if current_x + new_tab_size <= stride - padding - controls_space {
                 let new_tab_rect = Rect {
                     x: current_x,
@@ -901,6 +939,81 @@ impl TabBar {
             let row_start = (y * stride) as usize;
             let row = &mut pixels[row_start..row_start + stride as usize];
             row[x0 as usize..x1 as usize].fill(color);
+        }
+    }
+
+    fn blit_bitmap(
+        pixels: &mut [u32],
+        stride: i32,
+        height: i32,
+        bitmap: &LogoBitmap,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) {
+        if size <= 0 || bitmap.width == 0 || bitmap.height == 0 {
+            return;
+        }
+
+        let source = &bitmap.rgba;
+        let source_w = bitmap.width as u64;
+        let source_h = bitmap.height as u64;
+
+        let (draw_w, draw_h) = if source_w >= source_h {
+            (size, ((source_h * size as u64) / source_w).max(1) as i32)
+        } else {
+            (((source_w * size as u64) / source_h).max(1) as i32, size)
+        };
+        let draw_w = draw_w.max(1);
+        let draw_h = draw_h.max(1);
+        let origin_x = x + (size - draw_w) / 2;
+        let origin_y = y + (size - draw_h) / 2;
+
+        for dy in 0..draw_h {
+            let py = origin_y + dy;
+            if py < 0 || py >= height {
+                continue;
+            }
+
+            let sy0 = (dy as u64 * source_h / draw_h as u64) as usize;
+            let sy1 = (((dy + 1) as u64 * source_h / draw_h as u64) as usize).max(sy0 + 1);
+
+            for dx in 0..draw_w {
+                let px = origin_x + dx;
+                if px < 0 || px >= stride {
+                    continue;
+                }
+
+                let sx0 = (dx as u64 * source_w / draw_w as u64) as usize;
+                let sx1 = (((dx + 1) as u64 * source_w / draw_w as u64) as usize).max(sx0 + 1);
+
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                let mut sum_a = 0u32;
+                let mut samples = 0u32;
+
+                for sy in sy0..sy1.min(source_h as usize) {
+                    for sx in sx0..sx1.min(source_w as usize) {
+                        let index = (sy * bitmap.width as usize + sx) * 4;
+                        let alpha = source[index + 3] as u32;
+                        sum_r += source[index] as u32 * alpha;
+                        sum_g += source[index + 1] as u32 * alpha;
+                        sum_b += source[index + 2] as u32 * alpha;
+                        sum_a += alpha;
+                        samples += 1;
+                    }
+                }
+
+                if samples == 0 || sum_a == 0 {
+                    continue;
+                }
+
+                let color = ((sum_r / sum_a) << 16) | ((sum_g / sum_a) << 8) | (sum_b / sum_a);
+                let coverage = (sum_a / samples).min(255);
+                let target = (py * stride + px) as usize;
+                pixels[target] = blend_pixel(pixels[target], color, coverage);
+            }
         }
     }
 

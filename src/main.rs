@@ -3,6 +3,7 @@
 mod app;
 mod guest;
 mod host_events;
+mod icon;
 mod logging;
 mod tabbar;
 
