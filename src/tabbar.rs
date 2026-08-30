@@ -32,6 +32,7 @@ pub(crate) const COLOR_BORDER_INACTIVE: u32 = 0x00232433;
 pub(crate) enum Hit {
     Tab(usize),
     Close(usize),
+    Detach(usize),
     NewTab,
     Minimize,
     Maximize,
@@ -62,6 +63,7 @@ impl Rect {
 struct TabSlot {
     tab: Rect,
     close: Rect,
+    detach: Rect,
     guest_index: usize,
 }
 
@@ -104,6 +106,7 @@ pub(crate) struct TabBar {
     window_controls: Option<[Rect; 3]>,
     hover_tab: Option<usize>,
     hover_close: Option<usize>,
+    hover_detach: Option<usize>,
     hover_new_tab: bool,
     hover_control: Option<usize>,
     focused: bool,
@@ -154,6 +157,7 @@ impl TabBar {
             window_controls: None,
             hover_tab: None,
             hover_close: None,
+            hover_detach: None,
             hover_new_tab: false,
             hover_control: None,
             focused: false,
@@ -196,23 +200,26 @@ impl TabBar {
     }
 
     pub(crate) fn set_hover(&mut self, hit: Hit) {
-        let (tab, close, new_tab, control) = match hit {
-            Hit::Tab(index) => (Some(index), None, false, None),
-            Hit::Close(index) => (None, Some(index), false, None),
-            Hit::NewTab => (None, None, true, None),
-            Hit::Minimize => (None, None, false, Some(0)),
-            Hit::Maximize => (None, None, false, Some(1)),
-            Hit::CloseWindow => (None, None, false, Some(2)),
-            Hit::None => (None, None, false, None),
+        let (tab, close, detach, new_tab, control) = match hit {
+            Hit::Tab(index) => (Some(index), None, None, false, None),
+            Hit::Close(index) => (None, Some(index), None, false, None),
+            Hit::Detach(index) => (None, None, Some(index), false, None),
+            Hit::NewTab => (None, None, None, true, None),
+            Hit::Minimize => (None, None, None, false, Some(0)),
+            Hit::Maximize => (None, None, None, false, Some(1)),
+            Hit::CloseWindow => (None, None, None, false, Some(2)),
+            Hit::None => (None, None, None, false, None),
         };
 
         if tab != self.hover_tab
             || close != self.hover_close
+            || detach != self.hover_detach
             || new_tab != self.hover_new_tab
             || control != self.hover_control
         {
             self.hover_tab = tab;
             self.hover_close = close;
+            self.hover_detach = detach;
             self.hover_new_tab = new_tab;
             self.hover_control = control;
             self.dirty = true;
@@ -323,6 +330,9 @@ impl TabBar {
             if slot.close.contains(x, y) {
                 return Hit::Close(slot.guest_index);
             }
+            if slot.detach.contains(x, y) {
+                return Hit::Detach(slot.guest_index);
+            }
             if slot.tab.contains(x, y) {
                 return Hit::Tab(slot.guest_index);
             }
@@ -379,7 +389,7 @@ impl TabBar {
         let padding = scaled(6.0);
         let gap = scaled(4.0);
         let inset_y = scaled(4.0);
-        let min_tab_width = scaled(90.0);
+        let min_tab_width = scaled(96.0);
         let max_tab_width = scaled(220.0);
         let control_size = strip_height;
         let controls_space = control_size * 3;
@@ -506,6 +516,12 @@ impl TabBar {
                     w: close_side,
                     h: close_side,
                 };
+                let detach_rect = Rect {
+                    x: close_rect.x - close_side - scaled(2.0).max(1),
+                    y: close_rect.y,
+                    w: close_side,
+                    h: close_side,
+                };
 
                 let hovered = !floating && self.hover_tab == Some(model.guest_index);
                 let background = if model.active {
@@ -565,9 +581,58 @@ impl TabBar {
                     &model.title,
                     tab_rect.x + scaled(12.0),
                     baseline.round() as i32,
-                    close_rect.x - scaled(8.0),
+                    detach_rect.x - scaled(6.0),
                     text_color,
                 );
+
+                let detach_hovered = !floating && self.hover_detach == Some(model.guest_index);
+                if detach_hovered {
+                    Self::fill_rect(pixels, stride, canvas_height, detach_rect, COLOR_CLOSE_BG);
+                }
+                let detach_glyph_color = if detach_hovered {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_DIM
+                };
+                let detach_inset = ((detach_rect.w as f32 * 0.22).round() as i32).max(2);
+                let (dx0, dy0) = (detach_rect.x + detach_inset, detach_rect.y + detach_inset);
+                let (dx1, dy1) = (
+                    detach_rect.x + detach_rect.w - detach_inset - 1,
+                    detach_rect.y + detach_rect.h - detach_inset - 1,
+                );
+                Self::draw_line(
+                    pixels,
+                    stride,
+                    canvas_height,
+                    dx0,
+                    dy1,
+                    dx1,
+                    dy0,
+                    detach_glyph_color,
+                );
+                let arrow_head = ((detach_rect.w as f32 * 0.25).round() as i32).max(2);
+                if dx1 - dx0 > arrow_head + 1 {
+                    Self::draw_line(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        dx1 - arrow_head,
+                        dy0,
+                        dx1,
+                        dy0,
+                        detach_glyph_color,
+                    );
+                    Self::draw_line(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        dx1,
+                        dy0 + arrow_head,
+                        dx1,
+                        dy0,
+                        detach_glyph_color,
+                    );
+                }
 
                 let close_hovered = !floating && self.hover_close == Some(model.guest_index);
                 if close_hovered {
@@ -609,6 +674,7 @@ impl TabBar {
                     self.layout.push(TabSlot {
                         tab: tab_rect,
                         close: close_rect,
+                        detach: detach_rect,
                         guest_index: model.guest_index,
                     });
                 }

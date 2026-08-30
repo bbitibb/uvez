@@ -41,6 +41,8 @@ The guests are real, unmodified applications - `winfetch` inside a hosted tab re
 | **Switch tab** | `Left Click` on tab |
 | **Reorder tabs** | Drag a tab left or right |
 | **Close tab** | `Ctrl + Shift + W`, `Middle Click` on tab or `Left Click` on `×` |
+| **Detach tab** | `Left Click` on `↗` on a tab or `Ctrl + Alt + D` |
+| **Attach focused window** | `Ctrl + Alt + A` |
 | **Minimize / Maximize / Close** | Buttons in the top-right of the tab strip |
 | **Move window** | Drag the empty tab strip |
 | **Maximize / restore** | Double-click the empty tab strip |

@@ -9,10 +9,10 @@ mod tabbar;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicIsize, AtomicU32, Ordering},
 };
 
-use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, MSG, WM_HOTKEY};
 use windows::core::Result as WinResult;
 use winit::event_loop::EventLoop;
 use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -31,6 +31,14 @@ fn main() -> WinResult<()> {
     let close_tab_requested = Arc::new(AtomicU32::new(0));
     let hook_close_tab_requested = Arc::clone(&close_tab_requested);
 
+    let attach_requested = Arc::new(AtomicU32::new(0));
+    let hook_attach_requested = Arc::clone(&attach_requested);
+    let attach_target = Arc::new(AtomicIsize::new(0));
+    let hook_attach_target = Arc::clone(&attach_target);
+
+    let detach_requested = Arc::new(AtomicU32::new(0));
+    let hook_detach_requested = Arc::clone(&detach_requested);
+
     let mut event_loop_builder = EventLoop::builder();
     event_loop_builder.with_msg_hook(move |message| {
         let message = unsafe { &*message.cast::<MSG>() };
@@ -47,12 +55,29 @@ fn main() -> WinResult<()> {
                 hook_close_tab_requested.fetch_add(1, Ordering::Release);
                 return true;
             }
+            if message.wParam.0 == app::ATTACH_HOTKEY_ID as usize {
+                let foreground = unsafe { GetForegroundWindow() };
+                hook_attach_target.store(foreground.0 as isize, Ordering::Release);
+                hook_attach_requested.fetch_add(1, Ordering::Release);
+                return true;
+            }
+            if message.wParam.0 == app::DETACH_HOTKEY_ID as usize {
+                hook_detach_requested.fetch_add(1, Ordering::Release);
+                return true;
+            }
         }
         false
     });
 
     let event_loop = event_loop_builder.build().unwrap();
-    let mut app = App::new(switch_requested, new_tab_requested, close_tab_requested);
+    let mut app = App::new(
+        switch_requested,
+        new_tab_requested,
+        close_tab_requested,
+        attach_requested,
+        attach_target,
+        detach_requested,
+    );
     event_loop.run_app(&mut app).unwrap();
 
     if app.take_fatal_error().is_some() {

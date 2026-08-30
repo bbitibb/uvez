@@ -8,20 +8,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT, SetLastError, WPARAM,
+    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT, SetLastError, WPARAM,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible,
-    PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT, WM_APP,
-    WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClassNameW,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST,
+    IsWindow, IsWindowVisible, PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX,
+    WINDOWPLACEMENT, WM_APP, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
+    WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
-use windows::core::{BOOL, Result as WinResult};
+use windows::core::{BOOL, PWSTR, Result as WinResult};
 
 pub(crate) const WINDOW_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MANAGED_STYLE_MASK: u32 =
@@ -422,6 +425,51 @@ pub(crate) fn get_window_process_id(hwnd: HWND) -> u32 {
     pid
 }
 
+pub(crate) fn exe_path_for_process(pid: u32) -> Option<String> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+
+        let mut path_buffer = [0u16; 1024];
+        let mut length = u32::try_from(path_buffer.len()).unwrap_or(0);
+        let queried = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(handle);
+        queried.ok()?;
+
+        if length == 0 || length as usize > path_buffer.len() {
+            return None;
+        }
+
+        Some(String::from_utf16_lossy(&path_buffer[..length as usize]))
+    }
+}
+
+fn is_shell_surface(hwnd: HWND) -> bool {
+    const SHELL_SURFACE_CLASSES: [&str; 6] = [
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "Windows.UI.Core.CoreWindow",
+        "XamlExplorerHostIslandWindow",
+    ];
+
+    unsafe {
+        let mut buffer = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut buffer);
+        if length <= 0 {
+            return false;
+        }
+
+        let class = String::from_utf16_lossy(&buffer[..length as usize]);
+        SHELL_SURFACE_CLASSES.contains(&class.as_str())
+    }
+}
+
 pub(crate) fn format_title(raw: &str, fallback_exe: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -602,42 +650,7 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
         let windows =
             get_all_windows().map_err(|error| format!("failed to enumerate windows: {error}"))?;
         if let Some(info) = windows.into_iter().find(|window| window.pid == pid) {
-            let original_style = get_window_attribute(info.hwnd, GWL_STYLE)?;
-            let original_ex_style = get_window_attribute(info.hwnd, GWL_EXSTYLE)?;
-            let mut original_rect = RECT::default();
-            let mut original_placement = WINDOWPLACEMENT {
-                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                ..Default::default()
-            };
-
-            unsafe {
-                GetWindowRect(info.hwnd, &mut original_rect).map_err(|error| {
-                    format!("failed to capture original window bounds: {error}")
-                })?;
-                GetWindowPlacement(info.hwnd, &mut original_placement).map_err(|error| {
-                    format!("failed to capture original window placement: {error}")
-                })?;
-            }
-
-            let originally_visible = unsafe { IsWindowVisible(info.hwnd).as_bool() };
-            if originally_visible {
-                unsafe {
-                    let _ = ShowWindow(info.hwnd, SW_HIDE);
-                }
-            }
-
-            return Ok(DiscoveredWindow {
-                hwnd: info.hwnd.0 as isize,
-                pid,
-                title: format_title(&info.title, process_name),
-                exe_name: process_name.to_string(),
-                original_style,
-                original_ex_style,
-                original_owner: unsafe { GetWindowLongPtrW(info.hwnd, GWLP_HWNDPARENT) },
-                original_rect,
-                original_placement,
-                originally_visible,
-            });
+            return capture_window_state(info, process_name);
         }
 
         thread::sleep(Duration::from_millis(15));
@@ -646,6 +659,96 @@ fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindow
     Err(format!(
         "timed out waiting for a visible window from PID {pid}"
     ))
+}
+
+fn capture_window_state(info: WindowInfo, fallback_exe: &str) -> ManagedWindowArrival {
+    let original_style = get_window_attribute(info.hwnd, GWL_STYLE)?;
+    if original_style & WS_CHILD.0 != 0 {
+        return Err(format!("refusing to attach child window {:?}", info.hwnd));
+    }
+
+    let original_ex_style = get_window_attribute(info.hwnd, GWL_EXSTYLE)?;
+    let mut original_rect = RECT::default();
+    let mut original_placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+
+    unsafe {
+        GetWindowRect(info.hwnd, &mut original_rect)
+            .map_err(|error| format!("failed to capture original window bounds: {error}"))?;
+        GetWindowPlacement(info.hwnd, &mut original_placement)
+            .map_err(|error| format!("failed to capture original window placement: {error}"))?;
+    }
+
+    let originally_visible = unsafe { IsWindowVisible(info.hwnd).as_bool() };
+    if originally_visible {
+        unsafe {
+            let _ = ShowWindow(info.hwnd, SW_HIDE);
+        }
+    }
+
+    Ok(DiscoveredWindow {
+        hwnd: info.hwnd.0 as isize,
+        pid: info.pid,
+        title: format_title(&info.title, fallback_exe),
+        exe_name: fallback_exe.to_string(),
+        original_style,
+        original_ex_style,
+        original_owner: unsafe { GetWindowLongPtrW(info.hwnd, GWLP_HWNDPARENT) },
+        original_rect,
+        original_placement,
+        originally_visible,
+    })
+}
+
+pub(crate) fn request_adopt_window(
+    hwnd_value: isize,
+    sender: mpsc::Sender<ManagedWindowArrival>,
+    host_hwnd: Option<isize>,
+) {
+    thread::spawn(move || {
+        let arrival = adopt_existing_window(hwnd_value);
+        let _ = sender.send(arrival);
+
+        if let Some(hwnd) = host_hwnd {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_APP,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+}
+
+fn adopt_existing_window(hwnd_value: isize) -> ManagedWindowArrival {
+    let hwnd = HWND(hwnd_value as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err("the window to attach no longer exists".to_string());
+    }
+
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return Err("the window to attach is not visible".to_string());
+    }
+
+    if is_shell_surface(hwnd) {
+        return Err("refusing to attach a shell surface".to_string());
+    }
+
+    let pid = get_window_process_id(hwnd);
+    if pid == 0 {
+        return Err("could not identify the owning process of the window to attach".to_string());
+    }
+
+    let exe_name = exe_path_for_process(pid)
+        .map(|path| format_title(&path, "app"))
+        .unwrap_or_else(|| "app".to_string());
+    let title = get_window_title(hwnd);
+
+    capture_window_state(WindowInfo { hwnd, title, pid }, &exe_name)
 }
 
 #[cfg(test)]

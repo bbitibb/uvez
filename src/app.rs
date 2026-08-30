@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicIsize, AtomicU32, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -22,8 +22,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetDoubleClickTime, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey,
-    ReleaseCapture, SetCapture, UnregisterHotKey, VK_CONTROL, VK_LBUTTON, VK_T, VK_TAB, VK_W,
+    GetAsyncKeyState, GetDoubleClickTime, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+    RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_A, VK_CONTROL, VK_D,
+    VK_LBUTTON, VK_T, VK_TAB, VK_W,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -41,6 +42,8 @@ use winit::window::{Window, WindowId};
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
 pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
 pub(crate) const CLOSE_TAB_HOTKEY_ID: i32 = 3;
+pub(crate) const ATTACH_HOTKEY_ID: i32 = 4;
+pub(crate) const DETACH_HOTKEY_ID: i32 = 5;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
@@ -125,6 +128,20 @@ fn tab_sequence_for_order(display_order: &[usize], open: &[usize], total: usize)
     sequence
 }
 
+fn index_remap_after_compact(total: usize, keep: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut new_index_of_old = vec![usize::MAX; total];
+    let mut next_new = 0usize;
+
+    for (old, slot) in new_index_of_old.iter_mut().enumerate() {
+        if keep(old) {
+            *slot = next_new;
+            next_new += 1;
+        }
+    }
+
+    new_index_of_old
+}
+
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
@@ -137,12 +154,17 @@ pub(crate) struct App {
     switch_requested: Arc<AtomicU32>,
     new_tab_requested: Arc<AtomicU32>,
     close_tab_requested: Arc<AtomicU32>,
+    attach_requested: Arc<AtomicU32>,
+    attach_target: Arc<AtomicIsize>,
+    detach_requested: Arc<AtomicU32>,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
     hotkey_switch_registered: bool,
     hotkey_new_tab_registered: bool,
     hotkey_close_tab_registered: bool,
+    hotkey_detach_registered: bool,
+    hotkey_attach_registered: bool,
     arrival_tx: mpsc::Sender<guest::ManagedWindowArrival>,
     arrival_rx: mpsc::Receiver<guest::ManagedWindowArrival>,
     startup_spawns_pending: usize,
@@ -159,6 +181,9 @@ impl App {
         switch_requested: Arc<AtomicU32>,
         new_tab_requested: Arc<AtomicU32>,
         close_tab_requested: Arc<AtomicU32>,
+        attach_requested: Arc<AtomicU32>,
+        attach_target: Arc<AtomicIsize>,
+        detach_requested: Arc<AtomicU32>,
     ) -> Self {
         let (arrival_tx, arrival_rx) = mpsc::channel();
 
@@ -174,12 +199,17 @@ impl App {
             switch_requested,
             new_tab_requested,
             close_tab_requested,
+            attach_requested,
+            attach_target,
+            detach_requested,
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
             hotkey_switch_registered: false,
             hotkey_new_tab_registered: false,
             hotkey_close_tab_registered: false,
+            hotkey_detach_registered: false,
+            hotkey_attach_registered: false,
             arrival_tx,
             arrival_rx,
             startup_spawns_pending: 0,
@@ -508,9 +538,9 @@ impl App {
         self.sync_tab_bar_focus();
     }
 
-    fn activate_next_window(&mut self) {
+    fn next_candidate(&self) -> Option<usize> {
         if self.managed_windows.is_empty() {
-            return;
+            return None;
         }
 
         let mut candidates: Vec<usize> = self
@@ -534,9 +564,46 @@ impl App {
             let _ = candidates.remove(position);
         }
 
-        if let Some(next) = candidates.into_iter().next() {
+        candidates.into_iter().next()
+    }
+
+    fn activate_next_window(&mut self) {
+        if let Some(next) = self.next_candidate() {
             self.activate_window(next);
         }
+    }
+
+    fn show_next_window_without_focus(&mut self) {
+        let Some(next) = self.next_candidate() else {
+            self.refocus_pending = false;
+            return;
+        };
+
+        for other in 0..self.managed_windows.len() {
+            if other != next {
+                self.hide_window(other);
+            }
+        }
+
+        self.active = Some(next);
+        self.touch_mru(next);
+        self.native_host_events
+            .active_pid
+            .store(self.managed_windows[next].pid, Ordering::Release);
+        self.native_host_events.active_hwnd.store(
+            self.managed_windows[next].hwnd.0 as isize,
+            Ordering::Release,
+        );
+        self.bounds_dirty = false;
+        if !self.position_active_window() {
+            self.managed_windows[next].hide();
+        }
+
+        self.refocus_pending = false;
+        self.update_host_title();
+        self.mark_dirty();
+        self.update_hotkey_registration();
+        self.sync_tab_bar_focus();
     }
 
     fn ctrl_held() -> bool {
@@ -665,6 +732,21 @@ impl App {
 
         self.close_managed_window(active);
         self.activate_next_window();
+    }
+
+    fn detach_active_window(&mut self) {
+        let Some(active) = self.active else {
+            return;
+        };
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return;
+        }
+
+        self.detach_window(active);
     }
 
     fn close_all_managed_windows(&mut self) {
@@ -799,6 +881,41 @@ impl App {
                 Err(error) => debug_log!("Could not register Ctrl + W: {error}"),
             }
         }
+
+        if !self.hotkey_detach_registered {
+            match unsafe {
+                RegisterHotKey(
+                    None,
+                    DETACH_HOTKEY_ID,
+                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                    u32::from(VK_D.0),
+                )
+            } {
+                Ok(()) => self.hotkey_detach_registered = true,
+                Err(error) => debug_log!("Could not register Ctrl+Alt+D: {error}"),
+            }
+        }
+    }
+
+    fn register_attach_hotkey(&mut self) {
+        if self.hotkey_attach_registered {
+            return;
+        }
+
+        match unsafe {
+            RegisterHotKey(
+                None,
+                ATTACH_HOTKEY_ID,
+                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                u32::from(VK_A.0),
+            )
+        } {
+            Ok(()) => self.hotkey_attach_registered = true,
+            Err(error) => {
+                debug_log!("Could not register Ctrl+Alt+A: {error}");
+                debug_log!("Attaching the focused window is unavailable this session");
+            }
+        }
     }
 
     fn unregister_hotkeys(&mut self) {
@@ -811,6 +928,16 @@ impl App {
             && unsafe { UnregisterHotKey(None, NEW_TAB_HOTKEY_ID) }.is_ok()
         {
             self.hotkey_new_tab_registered = false;
+        }
+        if self.hotkey_close_tab_registered
+            && unsafe { UnregisterHotKey(None, CLOSE_TAB_HOTKEY_ID) }.is_ok()
+        {
+            self.hotkey_close_tab_registered = false;
+        }
+        if self.hotkey_detach_registered
+            && unsafe { UnregisterHotKey(None, DETACH_HOTKEY_ID) }.is_ok()
+        {
+            self.hotkey_detach_registered = false;
         }
     }
 
@@ -951,6 +1078,17 @@ impl App {
                 if was_active {
                     self.activate_next_window();
                 }
+            }
+            (MouseButton::Left, Hit::Detach(guest_index)) => {
+                if !self
+                    .managed_windows
+                    .get(guest_index)
+                    .is_some_and(ManagedWindow::is_open)
+                {
+                    return;
+                }
+
+                self.detach_window(guest_index);
             }
             (MouseButton::Left, Hit::Minimize) => {
                 if let Some(window) = self.window.as_deref() {
@@ -1111,27 +1249,93 @@ impl App {
         self.mark_dirty();
     }
 
-    fn prune_dead_guests(&mut self) -> bool {
+    fn attach_window(&mut self, target_value: isize) {
+        if target_value == 0 {
+            return;
+        }
+
+        let target = HWND(target_value as *mut c_void);
+        if self.host_hwnd().is_some_and(|host| host == target) {
+            return;
+        }
+
+        if self
+            .managed_windows
+            .iter()
+            .any(|managed| managed.is_open() && managed.hwnd == target)
+        {
+            return;
+        }
+
+        if guest::get_window_process_id(target) == std::process::id() {
+            return;
+        }
+
+        debug_log!("Attach requested for HWND {target:?}");
+        let host_hwnd = self.host_hwnd().map(|hwnd| hwnd.0 as isize);
+        guest::request_adopt_window(target_value, self.arrival_tx.clone(), host_hwnd);
+    }
+
+    fn detach_window(&mut self, index: usize) {
+        if !self
+            .managed_windows
+            .get(index)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return;
+        }
+
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+            self.cancel_tab_drag();
+        }
+
+        let was_active = self.active == Some(index);
+        if was_active {
+            let _ = self.reconcile_move_lift();
+        }
+
+        if let Err(error) = self.managed_windows[index].restore_native_state() {
+            debug_log!(
+                "Could not detach {}: {error}",
+                self.managed_windows[index].title
+            );
+            return;
+        }
+
+        let title = self.managed_windows[index].title.clone();
+        self.managed_windows[index].activate();
+        debug_log!("Detached {title} into a standalone window");
+
+        self.compact_managed_windows(|existing, _| existing != index);
+
+        if was_active {
+            self.show_next_window_without_focus();
+        }
+
+        self.update_host_title();
+        self.update_hotkey_registration();
+        self.sync_tab_bar_focus();
+        self.mark_dirty();
+    }
+
+    fn compact_managed_windows(&mut self, keep: impl Fn(usize, &ManagedWindow) -> bool) -> bool {
         let original_len = self.managed_windows.len();
         if original_len == 0 {
             return false;
         }
 
-        let mut new_index_of_old = vec![usize::MAX; original_len];
-        let mut next_new = 0usize;
-        let mut old_index = 0usize;
-
-        self.managed_windows.retain(|managed| {
-            let keep = managed.is_open();
-            if keep {
-                new_index_of_old[old_index] = next_new;
-                next_new += 1;
-            }
-            old_index += 1;
-            keep
+        let new_index_of_old = index_remap_after_compact(original_len, |index| {
+            keep(index, &self.managed_windows[index])
         });
 
-        if next_new == original_len {
+        let mut old_index = 0usize;
+        self.managed_windows.retain(|managed| {
+            let retained = keep(old_index, managed);
+            old_index += 1;
+            retained
+        });
+
+        if new_index_of_old.iter().all(|&mapped| mapped != usize::MAX) {
             return false;
         }
 
@@ -1149,27 +1353,44 @@ impl App {
             }
         }
 
-        self.mru.retain(|index| *index < self.managed_windows.len());
         self.mru = self
             .mru
             .iter()
-            .map(|index| new_index_of_old[*index])
+            .filter_map(|&index| new_index_of_old.get(index).copied())
+            .filter(|&mapped| mapped != usize::MAX)
             .collect();
 
         if let Some(session) = &mut self.cycle {
             session.order = session
                 .order
                 .iter()
-                .filter_map(|index| {
-                    let mapped = new_index_of_old[*index];
-                    (mapped != usize::MAX && self.managed_windows[mapped].is_open())
-                        .then_some(mapped)
+                .filter_map(|&index| {
+                    let mapped = new_index_of_old.get(index).copied()?;
+                    (mapped != usize::MAX
+                        && self
+                            .managed_windows
+                            .get(mapped)
+                            .is_some_and(ManagedWindow::is_open))
+                    .then_some(mapped)
                 })
                 .collect();
         }
 
         self.mark_dirty();
         true
+    }
+
+    fn prune_dead_guests(&mut self) -> bool {
+        let active_died = self
+            .active
+            .is_some_and(|active| !self.managed_windows[active].is_open());
+
+        let changed = self.compact_managed_windows(|_index, managed| managed.is_open());
+        if changed && active_died {
+            self.activate_next_window();
+        }
+
+        changed
     }
 
     fn housekeeping(&mut self) {
@@ -1262,9 +1483,12 @@ impl ApplicationHandler for App {
             self.spawn_new_tab();
         }
 
+        self.register_attach_hotkey();
+
         debug_log!(
-            "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab"
+            "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab, Ctrl+Shift+W closes the active tab, Ctrl+Alt+D detaches the active tab"
         );
+        debug_log!("Ctrl+Alt+A attaches the currently focused window as a new tab");
         self.update_hotkey_registration();
         self.sync_tab_bar_focus();
     }
@@ -1291,6 +1515,9 @@ impl ApplicationHandler for App {
                 self.switch_requested.store(0, Ordering::Release);
                 self.new_tab_requested.store(0, Ordering::Release);
                 self.close_tab_requested.store(0, Ordering::Release);
+                self.attach_requested.store(0, Ordering::Release);
+                self.attach_target.store(0, Ordering::Release);
+                self.detach_requested.store(0, Ordering::Release);
                 self.close_all_managed_windows();
                 event_loop.exit();
             }
@@ -1451,6 +1678,27 @@ impl ApplicationHandler for App {
             self.close_active_window();
         }
 
+        while self
+            .attach_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            let target = self.attach_target.swap(0, Ordering::AcqRel);
+            self.attach_window(target);
+        }
+
+        while self
+            .detach_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.detach_active_window();
+        }
+
         if self.last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
             self.housekeeping();
         }
@@ -1481,6 +1729,12 @@ impl ApplicationHandler for App {
             .active_pid
             .store(0, Ordering::Release);
         self.release_managed_windows();
+        if self.hotkey_attach_registered {
+            unsafe {
+                let _ = UnregisterHotKey(None, ATTACH_HOTKEY_ID);
+            }
+            self.hotkey_attach_registered = false;
+        }
         self.unregister_hotkeys();
         self.remove_host_subclass();
     }
@@ -1488,7 +1742,7 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::tab_sequence_for_order;
+    use super::{index_remap_after_compact, tab_sequence_for_order};
 
     #[test]
     fn identity_order_passes_through() {
@@ -1528,5 +1782,30 @@ mod tests {
     fn out_of_range_indices_are_ignored() {
         let open = [0, 1];
         assert_eq!(tab_sequence_for_order(&[1, 0], &open, 2), vec![1, 0]);
+    }
+
+    #[test]
+    fn remap_without_removals_is_identity() {
+        assert_eq!(index_remap_after_compact(3, |_| true), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remap_after_removing_middle() {
+        let remap = index_remap_after_compact(3, |index| index != 1);
+        assert_eq!(remap, vec![0, usize::MAX, 1]);
+    }
+
+    #[test]
+    fn remap_after_removing_first() {
+        let remap = index_remap_after_compact(3, |index| index != 0);
+        assert_eq!(remap, vec![usize::MAX, 0, 1]);
+    }
+
+    #[test]
+    fn remap_with_nothing_kept() {
+        assert_eq!(
+            index_remap_after_compact(2, |_| false),
+            vec![usize::MAX, usize::MAX]
+        );
     }
 }
