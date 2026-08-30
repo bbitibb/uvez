@@ -44,6 +44,15 @@ pub(crate) struct TabModel {
     pub(crate) guest_index: usize,
     pub(crate) title: String,
     pub(crate) active: bool,
+    pub(crate) group_id: Option<usize>,
+    pub(crate) group_color: Option<u32>,
+}
+
+pub(crate) struct ContentDivider {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) height: i32,
+    pub(crate) color: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +79,8 @@ struct TabSlot {
 #[derive(Clone, Copy)]
 struct DragState {
     guest_index: usize,
+    partner: Option<usize>,
+    side: i32,
     grab_offset: i32,
     cursor_x: i32,
     origin_x: i32,
@@ -101,6 +112,52 @@ fn drag_insertion(
     (clamped, (first_slot + local) as usize)
 }
 
+fn snap_insertion_around_pairs(
+    insertion: usize,
+    retained: &[usize],
+    previous: &[usize],
+    pairs: &[(usize, usize)],
+    moving: usize,
+) -> usize {
+    let mut insertion = insertion;
+
+    for &(a, b) in pairs {
+        if a == moving || b == moving {
+            continue;
+        }
+
+        let (Some(retained_a), Some(retained_b)) = (
+            retained.iter().position(|&guest| guest == a),
+            retained.iter().position(|&guest| guest == b),
+        ) else {
+            continue;
+        };
+        let (left, right) = if retained_a < retained_b {
+            (retained_a, retained_b)
+        } else {
+            (retained_b, retained_a)
+        };
+        if right != left + 1 || insertion != left + 1 {
+            continue;
+        }
+
+        let moving_right = match (
+            previous.iter().position(|&guest| guest == a),
+            previous.iter().position(|&guest| guest == b),
+            previous.iter().position(|&guest| guest == moving),
+        ) {
+            (Some(a_position), Some(b_position), Some(moving_position)) => {
+                moving_position < a_position.min(b_position)
+            }
+            _ => false,
+        };
+
+        insertion = if moving_right { right + 1 } else { left };
+    }
+
+    insertion
+}
+
 pub(crate) struct TabBar {
     _context: Context<Arc<Window>>,
     surface: Surface<Arc<Window>, Arc<Window>>,
@@ -125,6 +182,7 @@ pub(crate) struct TabBar {
     first_visible: usize,
     scroll_carry: f32,
     revealed_active: Option<usize>,
+    group_member_pairs: Vec<(usize, usize)>,
 }
 
 fn blend_pixel(background: u32, foreground: u32, coverage: u32) -> u32 {
@@ -183,6 +241,7 @@ impl TabBar {
             first_visible: 0,
             scroll_carry: 0.0,
             revealed_active: None,
+            group_member_pairs: Vec::new(),
         })
     }
 
@@ -248,7 +307,12 @@ impl TabBar {
         self.drag.is_some()
     }
 
-    pub(crate) fn begin_drag(&mut self, guest_index: usize, press_x: i32) -> bool {
+    pub(crate) fn begin_drag(
+        &mut self,
+        guest_index: usize,
+        partner: Option<usize>,
+        press_x: i32,
+    ) -> bool {
         if self.drag.is_some() || self.layout.len() < 2 {
             return false;
         }
@@ -263,6 +327,8 @@ impl TabBar {
 
         self.drag = Some(DragState {
             guest_index,
+            partner: partner.filter(|&p| p != guest_index),
+            side: 1,
             grab_offset: press_x - slot.tab.x,
             cursor_x: press_x,
             origin_x: 0,
@@ -295,20 +361,61 @@ impl TabBar {
             && drag.step > 0
             && drag.last_slot >= drag.first_slot
         {
+            let partner = drag
+                .partner
+                .filter(|&p| p != drag.guest_index && self.display_order.contains(&p));
+
+            let side = partner
+                .and_then(|p| {
+                    let dragged_position = self
+                        .display_order
+                        .iter()
+                        .position(|&guest| guest == drag.guest_index)?;
+                    let partner_position =
+                        self.display_order.iter().position(|&guest| guest == p)?;
+                    Some(if partner_position > dragged_position {
+                        1
+                    } else {
+                        -1
+                    })
+                })
+                .unwrap_or(drag.side);
+
+            let last_slot = drag.last_slot - i32::from(partner.is_some());
+            let cursor_left = cursor_x - drag.grab_offset;
+            let block_desired = cursor_left - if side < 0 { drag.step } else { 0 };
             let (_, insertion) = drag_insertion(
-                cursor_x - drag.grab_offset,
+                block_desired,
                 drag.origin_x,
                 drag.step,
                 drag.first_slot,
-                drag.last_slot,
+                last_slot,
             );
-            let mut order: Vec<usize> = self
-                .display_order
+
+            let previous = self.display_order.clone();
+            let mut order: Vec<usize> = previous
                 .iter()
                 .copied()
-                .filter(|&guest| guest != drag.guest_index)
+                .filter(|&guest| guest != drag.guest_index && Some(guest) != partner)
                 .collect();
-            order.insert(insertion.min(order.len()), drag.guest_index);
+            let insertion = snap_insertion_around_pairs(
+                insertion.min(order.len()),
+                &order,
+                &previous,
+                &self.group_member_pairs,
+                drag.guest_index,
+            );
+            if side > 0 {
+                order.insert(insertion, drag.guest_index);
+                if let Some(p) = partner {
+                    order.insert(insertion + 1, p);
+                }
+            } else if let Some(p) = partner {
+                order.insert(insertion, p);
+                order.insert(insertion + 1, drag.guest_index);
+            } else {
+                order.insert(insertion, drag.guest_index);
+            }
             self.display_order = order;
         }
 
@@ -373,7 +480,12 @@ impl TabBar {
         Hit::None
     }
 
-    pub(crate) fn draw(&mut self, window: &Window, tabs: &[TabModel]) {
+    pub(crate) fn draw(
+        &mut self,
+        window: &Window,
+        tabs: &[TabModel],
+        divider: Option<ContentDivider>,
+    ) {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
@@ -473,6 +585,22 @@ impl TabBar {
             }
             self.display_order = order.clone();
 
+            self.group_member_pairs.clear();
+            let mut grouped_members: Vec<(usize, Vec<usize>)> = Vec::new();
+            for model in tabs {
+                if let Some(group_id) = model.group_id {
+                    match grouped_members.iter_mut().find(|(id, _)| *id == group_id) {
+                        Some((_, members)) => members.push(model.guest_index),
+                        None => grouped_members.push((group_id, vec![model.guest_index])),
+                    }
+                }
+            }
+            for (_, members) in grouped_members {
+                if members.len() == 2 {
+                    self.group_member_pairs.push((members[0], members[1]));
+                }
+            }
+
             let active_guest = tabs
                 .iter()
                 .find(|model| model.active)
@@ -504,23 +632,59 @@ impl TabBar {
 
             let drag_state = self.drag;
             let mut drag_left: Option<i32> = None;
+            let mut drag_partner_left: Option<i32> = None;
+            let mut block_partner: Option<usize> = None;
             if let Some(drag) = drag_state {
                 if visible_count == 0 || order.len() < 2 || !order.contains(&drag.guest_index) {
                     self.drag = None;
                 } else if let Some(position) =
                     order.iter().position(|&guest| guest == drag.guest_index)
                 {
-                    let (clamped, insertion) = drag_insertion(
-                        drag.cursor_x - drag.grab_offset,
-                        origin_x,
-                        step,
-                        drag.first_slot,
-                        drag.last_slot,
+                    let partner = drag
+                        .partner
+                        .filter(|&p| p != drag.guest_index && order.contains(&p));
+                    let side = partner
+                        .and_then(|p| {
+                            let partner_position = order.iter().position(|&guest| guest == p)?;
+                            Some(if partner_position > position { 1 } else { -1 })
+                        })
+                        .unwrap_or(1);
+                    let last_slot = drag.last_slot - i32::from(partner.is_some());
+                    let cursor_left = drag.cursor_x - drag.grab_offset;
+                    let block_desired = cursor_left - if side < 0 { step } else { 0 };
+                    let (_, insertion) =
+                        drag_insertion(block_desired, origin_x, step, drag.first_slot, last_slot);
+
+                    let previous = order.clone();
+                    order.retain(|&guest| guest != drag.guest_index && Some(guest) != partner);
+                    let insertion = snap_insertion_around_pairs(
+                        insertion.min(order.len()),
+                        &order,
+                        &previous,
+                        &self.group_member_pairs,
+                        drag.guest_index,
                     );
-                    order.remove(position);
-                    order.insert(insertion.min(order.len()), drag.guest_index);
+                    if side > 0 {
+                        order.insert(insertion, drag.guest_index);
+                        if let Some(p) = partner {
+                            order.insert(insertion + 1, p);
+                        }
+                    } else if let Some(p) = partner {
+                        order.insert(insertion, p);
+                        order.insert(insertion + 1, drag.guest_index);
+                    } else {
+                        order.insert(insertion, drag.guest_index);
+                    }
+
+                    if let Some(drag) = self.drag.as_mut() {
+                        drag.side = side;
+                    }
                     self.display_order = order.clone();
-                    drag_left = Some(clamped);
+                    drag_left = Some(cursor_left);
+                    if let Some(p) = partner {
+                        block_partner = Some(p);
+                        drag_partner_left = Some((cursor_left + side * step).max(origin_x));
+                    }
                 }
             }
 
@@ -531,13 +695,17 @@ impl TabBar {
                 .take(visible_count)
                 .map(|(slot, &guest)| (slot - first_visible, guest))
                 .collect();
-            if let Some(drag) = drag_state
-                && let Some(position) = draw_sequence
-                    .iter()
-                    .position(|&(_, guest)| guest == drag.guest_index)
-            {
-                let entry = draw_sequence.remove(position);
-                draw_sequence.push(entry);
+            if let Some(drag) = drag_state {
+                let mut floated: Vec<(usize, usize)> = Vec::new();
+                draw_sequence.retain(|&(slot, guest)| {
+                    if guest == drag.guest_index || block_partner == Some(guest) {
+                        floated.push((slot, guest));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                draw_sequence.extend(floated);
             }
 
             let drawn_count = draw_sequence.len() as i32;
@@ -555,15 +723,20 @@ impl TabBar {
                 );
             }
 
-            for (slot, guest) in draw_sequence {
+            let mut group_stripes: Vec<(usize, i32, i32, u32)> = Vec::new();
+            for (slot, guest) in draw_sequence.iter().copied() {
                 let Some(model) = tabs.iter().find(|model| model.guest_index == guest) else {
                     continue;
                 };
                 let slot_x = origin_x + slot as i32 * step;
-                let floating =
-                    drag_left.is_some() && drag_state.is_some_and(|drag| drag.guest_index == guest);
-                let tab_x = if floating {
+                let floating = drag_left.is_some()
+                    && (drag_state.is_some_and(|drag| drag.guest_index == guest)
+                        || block_partner == Some(guest));
+                let tab_x = if floating && drag_state.is_some_and(|drag| drag.guest_index == guest)
+                {
                     drag_left.unwrap_or(slot_x)
+                } else if floating {
+                    drag_partner_left.unwrap_or(slot_x)
                 } else {
                     slot_x
                 };
@@ -588,17 +761,22 @@ impl TabBar {
                 };
 
                 let hovered = !floating && self.hover_tab == Some(model.guest_index);
-                let background = if model.active {
+                let base_background = if model.active {
                     COLOR_TAB_ACTIVE
                 } else if hovered {
                     COLOR_TAB_HOVER
                 } else {
                     COLOR_TAB_INACTIVE
                 };
+                let background = match model.group_color {
+                    Some(group_color) => blend_pixel(base_background, group_color, 32),
+                    None => base_background,
+                };
                 Self::fill_rect(pixels, stride, canvas_height, tab_rect, background);
 
                 if model.active {
                     let accent_height = scaled(2.0).max(2);
+                    let underline_color = model.group_color.unwrap_or(COLOR_ACCENT);
                     Self::fill_rect(
                         pixels,
                         stride,
@@ -609,8 +787,23 @@ impl TabBar {
                             w: tab_rect.w,
                             h: accent_height,
                         },
-                        COLOR_ACCENT,
+                        underline_color,
                     );
+                }
+
+                if let (Some(group_id), Some(group_color)) = (model.group_id, model.group_color) {
+                    match group_stripes
+                        .iter_mut()
+                        .find(|(id, _, _, _)| *id == group_id)
+                    {
+                        Some((_, start, end, _)) => {
+                            *start = (*start).min(slot_x);
+                            *end = (*end).max(slot_x + tab_width);
+                        }
+                        None => {
+                            group_stripes.push((group_id, slot_x, slot_x + tab_width, group_color))
+                        }
+                    }
                 }
 
                 if !floating && slot > 0 {
@@ -741,6 +934,30 @@ impl TabBar {
                         detach: detach_rect,
                         guest_index: model.guest_index,
                     });
+                }
+            }
+
+            let stripe_height = scaled(2.0).max(2);
+            for (_, start, end, color) in group_stripes {
+                let spans: Vec<(i32, i32)> = if end - start > tab_width + gap {
+                    vec![(start, start + tab_width), (end - tab_width, end)]
+                } else {
+                    vec![(start, end)]
+                };
+
+                for (span_start, span_end) in spans {
+                    Self::fill_rect(
+                        pixels,
+                        stride,
+                        canvas_height,
+                        Rect {
+                            x: span_start,
+                            y: inset_y,
+                            w: span_end - span_start,
+                            h: stripe_height,
+                        },
+                        color,
+                    );
                 }
             }
 
@@ -1021,6 +1238,21 @@ impl TabBar {
             }
         }
 
+        if let Some(divider) = divider {
+            Self::fill_rect(
+                pixels,
+                stride,
+                canvas_height,
+                Rect {
+                    x: divider.x - 1,
+                    y: divider.y,
+                    w: 3,
+                    h: divider.height,
+                },
+                divider.color,
+            );
+        }
+
         if !window.is_maximized() {
             let border_color = if self.focused {
                 COLOR_BORDER_ACTIVE
@@ -1060,10 +1292,13 @@ impl TabBar {
     }
 
     fn fill_rect(pixels: &mut [u32], stride: i32, height: i32, rect: Rect, color: u32) {
-        let x0 = rect.x.max(0);
-        let y0 = rect.y.max(0);
-        let x1 = (rect.x + rect.w).min(stride);
-        let y1 = (rect.y + rect.h).min(height);
+        let x0 = rect.x.max(0).min(stride);
+        let x1 = (rect.x + rect.w).max(0).min(stride);
+        let y0 = rect.y.max(0).min(height);
+        let y1 = (rect.y + rect.h).max(0).min(height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
 
         for y in y0..y1 {
             let row_start = (y * stride) as usize;
@@ -1266,7 +1501,86 @@ impl TabBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, blend_pixel, drag_insertion};
+    use super::{Rect, TabBar, blend_pixel, drag_insertion, snap_insertion_around_pairs};
+
+    #[test]
+    fn fill_rect_ignores_rects_outside_the_canvas() {
+        let mut pixels = vec![0u32; 16];
+
+        TabBar::fill_rect(
+            &mut pixels,
+            4,
+            4,
+            Rect {
+                x: 10,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            0x00FFFFFF,
+        );
+        TabBar::fill_rect(
+            &mut pixels,
+            4,
+            4,
+            Rect {
+                x: -3,
+                y: -3,
+                w: 2,
+                h: 2,
+            },
+            0x00FFFFFF,
+        );
+        TabBar::fill_rect(
+            &mut pixels,
+            4,
+            4,
+            Rect {
+                x: 0,
+                y: 10,
+                w: 2,
+                h: 2,
+            },
+            0x00FFFFFF,
+        );
+        TabBar::fill_rect(
+            &mut pixels,
+            4,
+            4,
+            Rect {
+                x: 2,
+                y: 2,
+                w: 0,
+                h: 0,
+            },
+            0x00FFFFFF,
+        );
+
+        assert!(pixels.iter().all(|&pixel| pixel == 0));
+    }
+
+    #[test]
+    fn fill_rect_clips_partially_visible_rects() {
+        let mut pixels = vec![0u32; 16];
+
+        TabBar::fill_rect(
+            &mut pixels,
+            4,
+            4,
+            Rect {
+                x: 2,
+                y: 1,
+                w: 10,
+                h: 10,
+            },
+            0x00FFFFFF,
+        );
+
+        let touched: Vec<usize> = (0..pixels.len())
+            .filter(|&index| pixels[index] == 0x00FFFFFF)
+            .collect();
+        assert_eq!(touched, vec![6, 7, 10, 11, 14, 15]);
+    }
 
     #[test]
     fn blend_coverage_zero_returns_background() {
@@ -1334,5 +1648,48 @@ mod tests {
         assert_eq!(drag_insertion(210, 10, 100, 2, 5), (210, 4));
         assert_eq!(drag_insertion(310, 10, 100, 2, 5), (310, 5));
         assert_eq!(drag_insertion(10_000, 10, 100, 2, 5), (310, 5));
+    }
+
+    #[test]
+    fn insertion_snaps_around_adjacent_grouped_pair() {
+        let pairs = vec![(1, 2)];
+
+        let retained = [1, 2, 3];
+        let previous = [0, 1, 2, 3];
+        assert_eq!(
+            snap_insertion_around_pairs(1, &retained, &previous, &pairs, 0),
+            2
+        );
+
+        let retained = [0, 1, 2];
+        let previous = [0, 1, 2, 3];
+        assert_eq!(
+            snap_insertion_around_pairs(2, &retained, &previous, &pairs, 3),
+            1
+        );
+
+        let retained = [1, 2, 3];
+        let previous = [1, 0, 2, 3];
+        assert_eq!(
+            snap_insertion_around_pairs(1, &retained, &previous, &pairs, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn insertion_passes_non_adjacent_pairs_and_own_group() {
+        let pairs = vec![(1, 3)];
+        let retained = [0, 1, 2, 3];
+        let previous = [0, 1, 2, 3];
+        assert_eq!(
+            snap_insertion_around_pairs(2, &retained, &previous, &pairs, 0),
+            2
+        );
+
+        let pairs = vec![(0, 2)];
+        assert_eq!(
+            snap_insertion_around_pairs(1, &retained, &previous, &pairs, 0),
+            1
+        );
     }
 }

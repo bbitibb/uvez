@@ -8,10 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT, SetLastError, WPARAM,
+    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, RemoveWindowSubclass, SUBCLASSPROC, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClassNameW,
@@ -20,13 +23,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, IsWindowVisible, PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX,
-    WINDOWPLACEMENT, WM_APP, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE,
-    WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    WINDOWPLACEMENT, WM_ACTIVATE, WM_APP, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PWSTR, Result as WinResult};
 
 pub(crate) const WINDOW_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const GUEST_SUBCLASS_ID: usize = 2;
+const GUEST_SUBCLASS_PROC: SUBCLASSPROC = Some(guest_subclass_proc);
 pub(crate) const MANAGED_STYLE_MASK: u32 =
     WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0;
 pub(crate) const MANAGED_EX_STYLE_MASK: u32 = WS_EX_DLGMODALFRAME.0
@@ -152,6 +157,28 @@ fn set_window_owner(hwnd: HWND, owner: isize) -> Result<(), String> {
     }
 }
 
+unsafe extern "system" fn guest_subclass_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    if message == WM_ACTIVATE && reference_data != 0 && (wparam.0 & 0xFFFF) as u16 != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(reference_data as *mut c_void)),
+                WM_APP,
+                WPARAM(hwnd.0 as usize),
+                LPARAM(0),
+            );
+        }
+    }
+
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
 impl ManagedWindow {
     pub(crate) fn is_open(&self) -> bool {
         let exists = unsafe { IsWindow(Some(self.hwnd)).as_bool() };
@@ -232,6 +259,18 @@ impl ManagedWindow {
             originally_visible: self.originally_visible,
         });
 
+        let installed = unsafe {
+            SetWindowSubclass(
+                self.hwnd,
+                GUEST_SUBCLASS_PROC,
+                GUEST_SUBCLASS_ID,
+                owner.0 as usize,
+            )
+        };
+        if !installed.as_bool() {
+            debug_log!("Could not observe focus changes for {}", self.title);
+        }
+
         Ok(())
     }
 
@@ -301,6 +340,9 @@ impl ManagedWindow {
 
         if restore_result.is_ok() {
             self.managed_mode = false;
+            unsafe {
+                let _ = RemoveWindowSubclass(self.hwnd, GUEST_SUBCLASS_PROC, GUEST_SUBCLASS_ID);
+            }
             unregister_panic_restore(self.hwnd);
             unsafe {
                 let command = if self.originally_visible {
@@ -329,7 +371,7 @@ impl ManagedWindow {
         }
     }
 
-    fn show(&self) {
+    pub(crate) fn show_no_activate(&self) {
         if !self.is_open() {
             return;
         }
@@ -354,7 +396,7 @@ impl ManagedWindow {
             return;
         }
 
-        self.show();
+        self.show_no_activate();
 
         unsafe {
             if let Err(error) = BringWindowToTop(self.hwnd) {
@@ -553,6 +595,20 @@ fn lock_restore_registry() -> MutexGuard<'static, Vec<RestoreRecord>> {
 pub(crate) fn install_panic_restore_hook() {
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = if let Some(payload) = info.payload().downcast_ref::<&str>() {
+            (*payload).to_string()
+        } else if let Some(payload) = info.payload().downcast_ref::<String>() {
+            payload.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        crate::logging::write_debug_line(&format!("PANIC at {location}: {message}\n{backtrace}"));
+
         restore_registered_windows();
         previous_hook(info);
     }));

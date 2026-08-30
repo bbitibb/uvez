@@ -18,23 +18,57 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::guest::get_window_process_id;
 
 pub(crate) const HOST_SUBCLASS_ID: usize = 1;
+pub(crate) const MAX_VISIBLE_GUESTS: usize = 4;
 
 pub(crate) const HOST_SUBCLASS_PROC: SUBCLASSPROC = Some(host_subclass_proc);
 
 #[derive(Default)]
+pub(crate) struct GuestSlot {
+    pub(crate) hwnd: AtomicIsize,
+    pub(crate) pid: AtomicU32,
+}
+
+#[derive(Default)]
+struct LiftSlot {
+    hwnd: AtomicIsize,
+    pid: AtomicU32,
+    was_topmost: AtomicBool,
+}
+
+#[derive(Default)]
 pub(crate) struct NativeHostEvents {
-    pub(crate) active_hwnd: AtomicIsize,
-    pub(crate) active_pid: AtomicU32,
-    pub(crate) lifted_hwnd: AtomicIsize,
-    pub(crate) lifted_pid: AtomicU32,
-    lifted_was_topmost: AtomicBool,
+    pub(crate) visible: [GuestSlot; MAX_VISIBLE_GUESTS],
+    lifted: [LiftSlot; MAX_VISIBLE_GUESTS],
     pub(crate) in_size_move: AtomicBool,
     pub(crate) size_move_finished: AtomicBool,
     pub(crate) subclass_ref_released: AtomicBool,
 }
 
-pub(crate) fn hwnd_from_atomic(value: isize) -> HWND {
-    HWND(value as *mut c_void)
+impl NativeHostEvents {
+    pub(crate) fn set_visible(&self, guests: &[(isize, u32)]) {
+        for (slot_index, slot) in self.visible.iter().enumerate() {
+            match guests.get(slot_index) {
+                Some(&(hwnd, pid)) => {
+                    slot.hwnd.store(hwnd, Ordering::Release);
+                    slot.pid.store(pid, Ordering::Release);
+                }
+                None => {
+                    slot.hwnd.store(0, Ordering::Release);
+                    slot.pid.store(0, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_visible(&self) {
+        self.set_visible(&[]);
+    }
+
+    pub(crate) fn has_lifted(&self) -> bool {
+        self.lifted
+            .iter()
+            .any(|lift| lift.hwnd.load(Ordering::Acquire) != 0)
+    }
 }
 
 fn hwnd_matches_pid(hwnd: HWND, expected_pid: u32) -> bool {
@@ -51,19 +85,8 @@ fn frame_thickness(hwnd: HWND) -> (i32, i32) {
     }
 }
 
-fn lift_active_guest(events: &NativeHostEvents, host_hwnd: HWND) {
+fn lift_visible_guests(events: &NativeHostEvents, host_hwnd: HWND) {
     if unsafe { GetForegroundWindow() } != host_hwnd {
-        return;
-    }
-
-    let active_value = events.active_hwnd.load(Ordering::Acquire);
-    let active_pid = events.active_pid.load(Ordering::Acquire);
-    if active_value == 0 {
-        return;
-    }
-
-    let active_hwnd = hwnd_from_atomic(active_value);
-    if !hwnd_matches_pid(active_hwnd, active_pid) {
         return;
     }
 
@@ -71,75 +94,86 @@ fn lift_active_guest(events: &NativeHostEvents, host_hwnd: HWND) {
         return;
     }
 
-    let ex_style = unsafe { GetWindowLongPtrW(active_hwnd, GWL_EXSTYLE) as u32 };
-    let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
-    let lifted = unsafe {
-        SetWindowPos(
-            active_hwnd,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
+    for slot in &events.visible {
+        let hwnd_value = slot.hwnd.load(Ordering::Acquire);
+        if hwnd_value == 0 {
+            continue;
+        }
 
-    if lifted.is_ok() {
-        events
-            .lifted_was_topmost
-            .store(was_topmost, Ordering::Release);
-        events.lifted_pid.store(active_pid, Ordering::Release);
-        events.lifted_hwnd.store(active_value, Ordering::Release);
+        let hwnd = HWND(hwnd_value as *mut c_void);
+        let pid = slot.pid.load(Ordering::Acquire);
+        if !hwnd_matches_pid(hwnd, pid) {
+            continue;
+        }
+
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 };
+        let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
+        let lifted = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        };
+
+        if lifted.is_ok()
+            && let Some(lift) = events
+                .lifted
+                .iter()
+                .find(|lift| lift.hwnd.load(Ordering::Acquire) == 0)
+        {
+            lift.was_topmost.store(was_topmost, Ordering::Release);
+            lift.pid.store(pid, Ordering::Release);
+            lift.hwnd.store(hwnd_value, Ordering::Release);
+        }
     }
 }
 
 pub(crate) fn release_lifted_guest(events: &NativeHostEvents) -> bool {
-    let lifted_value = events.lifted_hwnd.load(Ordering::Acquire);
-    if lifted_value == 0 {
-        return true;
+    let mut all_released = true;
+
+    for lift in &events.lifted {
+        let hwnd_value = lift.hwnd.load(Ordering::Acquire);
+        if hwnd_value == 0 {
+            continue;
+        }
+
+        let hwnd = HWND(hwnd_value as *mut c_void);
+        let pid = lift.pid.load(Ordering::Acquire);
+        if !hwnd_matches_pid(hwnd, pid) {
+            lift.hwnd.store(0, Ordering::Release);
+            continue;
+        }
+
+        let insert_after = if lift.was_topmost.load(Ordering::Acquire) {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        let released = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(insert_after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        };
+
+        if released.is_ok() {
+            lift.hwnd.store(0, Ordering::Release);
+        } else {
+            all_released = false;
+        }
     }
 
-    let lifted_hwnd = hwnd_from_atomic(lifted_value);
-    let lifted_pid = events.lifted_pid.load(Ordering::Acquire);
-    if !hwnd_matches_pid(lifted_hwnd, lifted_pid) {
-        let _ = events.lifted_hwnd.compare_exchange(
-            lifted_value,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        return true;
-    }
-
-    let insert_after = if events.lifted_was_topmost.load(Ordering::Acquire) {
-        HWND_TOPMOST
-    } else {
-        HWND_NOTOPMOST
-    };
-    let released = unsafe {
-        SetWindowPos(
-            lifted_hwnd,
-            Some(insert_after),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
-
-    if released.is_ok() {
-        let _ = events.lifted_hwnd.compare_exchange(
-            lifted_value,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        true
-    } else {
-        false
-    }
+    all_released
 }
 
 unsafe extern "system" fn host_subclass_proc(
@@ -195,7 +229,7 @@ unsafe extern "system" fn host_subclass_proc(
             WM_ENTERSIZEMOVE => {
                 events.size_move_finished.store(false, Ordering::Release);
                 events.in_size_move.store(true, Ordering::Release);
-                lift_active_guest(events, hwnd);
+                lift_visible_guests(events, hwnd);
             }
             WM_EXITSIZEMOVE => {
                 let _ = release_lifted_guest(events);

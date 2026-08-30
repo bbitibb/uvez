@@ -39,6 +39,9 @@ fn main() -> WinResult<()> {
     let detach_requested = Arc::new(AtomicU32::new(0));
     let hook_detach_requested = Arc::clone(&detach_requested);
 
+    let group_requested = Arc::new(AtomicU32::new(0));
+    let hook_group_requested = Arc::clone(&group_requested);
+
     let mut event_loop_builder = EventLoop::builder();
     event_loop_builder.with_msg_hook(move |message| {
         let message = unsafe { &*message.cast::<MSG>() };
@@ -65,6 +68,10 @@ fn main() -> WinResult<()> {
                 hook_detach_requested.fetch_add(1, Ordering::Release);
                 return true;
             }
+            if message.wParam.0 == app::GROUP_HOTKEY_ID as usize {
+                hook_group_requested.fetch_add(1, Ordering::Release);
+                return true;
+            }
         }
         false
     });
@@ -77,6 +84,7 @@ fn main() -> WinResult<()> {
         attach_requested,
         attach_target,
         detach_requested,
+        group_requested,
     );
     event_loop.run_app(&mut app).unwrap();
 

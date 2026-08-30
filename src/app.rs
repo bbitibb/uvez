@@ -13,8 +13,8 @@ use crate::host_events::{
 };
 use crate::icon;
 use crate::tabbar::{
-    COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE, Hit, TAB_BAR_HEIGHT_LOGICAL, TAB_BORDER_WIDTH,
-    TabBar, TabModel,
+    COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE, ContentDivider, Hit, TAB_BAR_HEIGHT_LOGICAL,
+    TAB_BORDER_WIDTH, TabBar, TabModel,
 };
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
-    RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_A, VK_CONTROL, VK_D,
+    RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_A, VK_CONTROL, VK_D, VK_G,
     VK_LBUTTON, VK_T, VK_TAB, VK_W,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
@@ -44,6 +44,18 @@ pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
 pub(crate) const CLOSE_TAB_HOTKEY_ID: i32 = 3;
 pub(crate) const ATTACH_HOTKEY_ID: i32 = 4;
 pub(crate) const DETACH_HOTKEY_ID: i32 = 5;
+pub(crate) const GROUP_HOTKEY_ID: i32 = 6;
+
+const GROUP_DIVIDER_LOGICAL: f64 = 8.0;
+const GROUP_PALETTE: [u32; 6] = [
+    0x00BB9AF7, 0x009ECE6A, 0x00E0AF68, 0x00F7768E, 0x0073DACA, 0x002AC3DE,
+];
+
+#[derive(Clone, Copy)]
+struct TabGroup {
+    members: [usize; 2],
+    color: u32,
+}
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
@@ -142,6 +154,84 @@ fn index_remap_after_compact(total: usize, keep: impl Fn(usize) -> bool) -> Vec<
     new_index_of_old
 }
 
+fn pane_rects(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    divider: i32,
+    count: usize,
+) -> Vec<WindowBounds> {
+    if count == 0 || width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+
+    if count == 1 {
+        return vec![WindowBounds {
+            x,
+            y,
+            width,
+            height,
+        }];
+    }
+
+    let pane_width = (width - divider * (count as i32 - 1)) / count as i32;
+    if pane_width <= 0 {
+        return Vec::new();
+    }
+
+    (0..count)
+        .map(|slot| WindowBounds {
+            x: x + slot as i32 * (pane_width + divider),
+            y,
+            width: pane_width,
+            height,
+        })
+        .collect()
+}
+
+fn grouping_candidate(
+    active: usize,
+    total: usize,
+    mru: &[usize],
+    is_open: impl Fn(usize) -> bool,
+    is_grouped: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut candidates: Vec<usize> = mru
+        .iter()
+        .copied()
+        .filter(|&index| index < total && index != active && is_open(index))
+        .collect();
+
+    for index in 0..total {
+        if index != active && is_open(index) && !candidates.contains(&index) {
+            candidates.push(index);
+        }
+    }
+
+    candidates.into_iter().find(|&index| !is_grouped(index))
+}
+
+fn remap_tab_groups(groups: &[TabGroup], new_index_of_old: &[usize]) -> Vec<TabGroup> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let mapped: Vec<usize> = group
+                .members
+                .iter()
+                .filter_map(|&member| new_index_of_old.get(member).copied())
+                .collect();
+
+            (mapped.len() == group.members.len()
+                && mapped.iter().all(|&mapped| mapped != usize::MAX))
+            .then(|| TabGroup {
+                members: [mapped[0], mapped[1]],
+                color: group.color,
+            })
+        })
+        .collect()
+}
+
 pub(crate) struct App {
     window: Option<Arc<Window>>,
     managed_windows: Vec<ManagedWindow>,
@@ -157,6 +247,9 @@ pub(crate) struct App {
     attach_requested: Arc<AtomicU32>,
     attach_target: Arc<AtomicIsize>,
     detach_requested: Arc<AtomicU32>,
+    group_requested: Arc<AtomicU32>,
+    groups: Vec<TabGroup>,
+    palette_cursor: usize,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
@@ -164,6 +257,7 @@ pub(crate) struct App {
     hotkey_new_tab_registered: bool,
     hotkey_close_tab_registered: bool,
     hotkey_detach_registered: bool,
+    hotkey_group_registered: bool,
     hotkey_attach_registered: bool,
     arrival_tx: mpsc::Sender<guest::ManagedWindowArrival>,
     arrival_rx: mpsc::Receiver<guest::ManagedWindowArrival>,
@@ -184,6 +278,7 @@ impl App {
         attach_requested: Arc<AtomicU32>,
         attach_target: Arc<AtomicIsize>,
         detach_requested: Arc<AtomicU32>,
+        group_requested: Arc<AtomicU32>,
     ) -> Self {
         let (arrival_tx, arrival_rx) = mpsc::channel();
 
@@ -202,6 +297,9 @@ impl App {
             attach_requested,
             attach_target,
             detach_requested,
+            group_requested,
+            groups: Vec::new(),
+            palette_cursor: 0,
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
@@ -209,6 +307,7 @@ impl App {
             hotkey_new_tab_registered: false,
             hotkey_close_tab_registered: false,
             hotkey_detach_registered: false,
+            hotkey_group_registered: false,
             hotkey_attach_registered: false,
             arrival_tx,
             arrival_rx,
@@ -331,7 +430,7 @@ impl App {
         }
     }
 
-    fn host_content_bounds(&self) -> Option<WindowBounds> {
+    fn host_content_frame(&self) -> Option<WindowBounds> {
         let window = self.window.as_ref()?;
         let position = window.inner_position().ok()?;
         let size = window.inner_size();
@@ -353,6 +452,194 @@ impl App {
         })
     }
 
+    fn visible_members(&self, index: usize) -> Vec<usize> {
+        if let Some(group_index) = self.group_of(index) {
+            let group = &self.groups[group_index];
+            let mut members: Vec<usize> = group
+                .members
+                .iter()
+                .copied()
+                .filter(|&member| {
+                    self.managed_windows
+                        .get(member)
+                        .is_some_and(ManagedWindow::is_open)
+                })
+                .collect();
+
+            if members.len() == group.members.len() {
+                members.sort_unstable();
+                return members;
+            }
+        }
+
+        vec![index]
+    }
+
+    fn layout_rects(&self) -> Option<Vec<(usize, WindowBounds)>> {
+        let active = self.active?;
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return None;
+        }
+
+        let frame = self.host_content_frame()?;
+        let members = self.visible_members(active);
+        let divider = (GROUP_DIVIDER_LOGICAL * self.scale_factor()).round() as i32;
+        let panes = pane_rects(
+            frame.x,
+            frame.y,
+            frame.width,
+            frame.height,
+            divider,
+            members.len(),
+        );
+        if panes.len() != members.len() {
+            return None;
+        }
+
+        Some(members.into_iter().zip(panes).collect())
+    }
+
+    fn content_divider(&self) -> Option<ContentDivider> {
+        let active = self.active?;
+        if self.visible_members(active).len() < 2 {
+            return None;
+        }
+
+        let rects = self.layout_rects()?;
+        if rects.len() < 2 {
+            return None;
+        }
+
+        let window = self.window.as_ref()?;
+        let origin = window.inner_position().ok()?;
+
+        let color = self.groups[self.group_of(active)?].color;
+        let gap_start = rects[0].1.x + rects[0].1.width;
+        let gap_end = rects[1].1.x;
+
+        Some(ContentDivider {
+            x: (gap_start + gap_end) / 2 - origin.x,
+            y: rects[0].1.y - origin.y,
+            height: rects[0].1.height,
+            color,
+        })
+    }
+
+    fn group_of(&self, index: usize) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| group.members.contains(&index))
+    }
+
+    fn drag_partner_of(&self, index: usize) -> Option<usize> {
+        let group_index = self.group_of(index)?;
+        let [a, b] = self.groups[group_index].members;
+        let candidate = if a == index { b } else { a };
+
+        self.managed_windows
+            .get(candidate)
+            .is_some_and(ManagedWindow::is_open)
+            .then_some(candidate)
+    }
+
+    fn next_group_color(&mut self) -> u32 {
+        if let Some(color) = GROUP_PALETTE
+            .iter()
+            .find(|color| !self.groups.iter().any(|group| group.color == **color))
+        {
+            return *color;
+        }
+
+        let color = GROUP_PALETTE[self.palette_cursor % GROUP_PALETTE.len()];
+        self.palette_cursor = (self.palette_cursor + 1) % GROUP_PALETTE.len();
+        color
+    }
+
+    fn toggle_group(&mut self) {
+        let Some(active) = self.active else {
+            return;
+        };
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return;
+        }
+
+        if let Some(group_index) = self.group_of(active) {
+            self.groups.remove(group_index);
+            debug_log!("Ungrouped tab {}", active + 1);
+        } else {
+            let total = self.managed_windows.len();
+            let Some(other) = grouping_candidate(
+                active,
+                total,
+                &self.mru,
+                |index| self.managed_windows[index].is_open(),
+                |index| self.group_of(index).is_some(),
+            ) else {
+                debug_log!("No ungrouped tab available to group with");
+                return;
+            };
+
+            let color = self.next_group_color();
+            self.groups.push(TabGroup {
+                members: [active, other],
+                color,
+            });
+            debug_log!("Grouped tab {} with tab {}", active + 1, other + 1);
+        }
+
+        self.refresh_layout();
+    }
+
+    fn sync_visible_slots(&self) {
+        let guests: Vec<(isize, u32)> = self
+            .active
+            .map(|active| self.visible_members(active))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|index| {
+                let managed = self.managed_windows.get(index)?;
+                managed
+                    .is_open()
+                    .then_some((managed.hwnd.0 as isize, managed.pid))
+            })
+            .collect();
+        self.native_host_events.set_visible(&guests);
+    }
+    fn refresh_layout(&mut self) {
+        let _ = self.reconcile_move_lift();
+
+        if let Some(active) = self.active {
+            let members = self.visible_members(active);
+
+            for index in 0..self.managed_windows.len() {
+                if self.managed_windows[index].is_open() && !members.contains(&index) {
+                    self.hide_window(index);
+                }
+            }
+
+            if self.position_visible_members() {
+                for &member in &members {
+                    if member != active && self.managed_windows[member].is_open() {
+                        self.managed_windows[member].show_no_activate();
+                    }
+                }
+            }
+        }
+
+        self.sync_visible_slots();
+        self.bounds_dirty = false;
+        self.mark_dirty();
+        self.sync_tab_bar_focus();
+        self.update_hotkey_registration();
+    }
     fn host_hwnd(&self) -> Option<HWND> {
         let handle = self.window.as_ref()?.window_handle().ok()?;
 
@@ -365,11 +652,19 @@ impl App {
     fn group_is_foreground(&self) -> bool {
         let foreground = unsafe { GetForegroundWindow() };
 
-        self.host_hwnd().is_some_and(|host| foreground == host)
-            || self
-                .active
-                .and_then(|index| self.managed_windows.get(index))
+        if self.host_hwnd().is_some_and(|host| foreground == host) {
+            return true;
+        }
+
+        let Some(active) = self.active else {
+            return false;
+        };
+
+        self.visible_members(active).iter().any(|&member| {
+            self.managed_windows
+                .get(member)
                 .is_some_and(|managed| managed.is_open() && foreground == managed.hwnd)
+        })
     }
 
     fn reconcile_move_lift(&mut self) -> bool {
@@ -399,27 +694,26 @@ impl App {
             return;
         };
 
-        let managed = &self.managed_windows[active];
-        if !managed.is_open() {
-            return;
-        }
-        let result = unsafe {
-            SetWindowPos(
-                managed.hwnd,
-                Some(HWND_TOP),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            )
-        };
+        for member in self.visible_members(active) {
+            let managed = &self.managed_windows[member];
+            if !managed.is_open() {
+                continue;
+            }
+            let result = unsafe {
+                SetWindowPos(
+                    managed.hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
 
-        if let Err(error) = result {
-            debug_log!(
-                "Could not raise {} above the Uvez host: {error}",
-                managed.title
-            );
+            if let Err(error) = result {
+                debug_log!("Could not raise {}: {error}", managed.title);
+            }
         }
     }
 
@@ -445,27 +739,48 @@ impl App {
         }
     }
 
-    fn position_active_window(&self) -> bool {
-        let (Some(active), Some(bounds)) = (self.active, self.host_content_bounds()) else {
+    fn position_visible_members(&self) -> bool {
+        let Some(active) = self.active else {
+            return false;
+        };
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            debug_log!(
+                "Managed HWND {:?} is no longer valid",
+                self.managed_windows[active].hwnd
+            );
+            return false;
+        }
+
+        let Some(rects) = self.layout_rects() else {
             return false;
         };
 
-        let managed = &self.managed_windows[active];
-        if !managed.is_open() {
-            debug_log!("Managed HWND {:?} is no longer valid", managed.hwnd);
-            return false;
+        let mut focused_positioned = false;
+        for (index, bounds) in rects {
+            let managed = &self.managed_windows[index];
+            if !managed.is_open() {
+                continue;
+            }
+
+            if let Err(error) = managed.position(bounds) {
+                debug_log!("Could not position {}: {error}", managed.title);
+                continue;
+            }
+
+            if index == active {
+                focused_positioned = true;
+            }
         }
 
-        if let Err(error) = managed.position(bounds) {
-            debug_log!("Could not position {}: {error}", managed.title);
-            return false;
-        }
-
-        true
+        focused_positioned
     }
 
     fn sync_group_bounds(&mut self) {
-        self.bounds_dirty = !self.position_active_window();
+        self.bounds_dirty = !self.position_visible_members();
     }
 
     fn update_host_title(&self) {
@@ -497,22 +812,17 @@ impl App {
             return;
         }
 
+        let members = self.visible_members(index);
         for other in 0..self.managed_windows.len() {
-            if other != index {
+            if other != index && !members.contains(&other) {
                 self.hide_window(other);
             }
         }
 
         self.active = Some(index);
-        self.native_host_events
-            .active_pid
-            .store(self.managed_windows[index].pid, Ordering::Release);
-        self.native_host_events.active_hwnd.store(
-            self.managed_windows[index].hwnd.0 as isize,
-            Ordering::Release,
-        );
+        self.sync_visible_slots();
         self.bounds_dirty = false;
-        let can_show = self.position_active_window();
+        let can_show = self.position_visible_members();
 
         {
             let managed = &self.managed_windows[index];
@@ -525,10 +835,19 @@ impl App {
             );
         }
         if can_show {
+            for &member in &members {
+                if member != index && self.managed_windows[member].is_open() {
+                    self.managed_windows[member].show_no_activate();
+                }
+            }
             self.raise_host_without_activation();
             self.managed_windows[index].activate();
         } else {
-            self.managed_windows[index].hide();
+            for &member in &members {
+                if self.managed_windows[member].is_open() {
+                    self.managed_windows[member].hide();
+                }
+            }
         }
 
         self.refocus_pending = false;
@@ -576,27 +895,33 @@ impl App {
     fn show_next_window_without_focus(&mut self) {
         let Some(next) = self.next_candidate() else {
             self.refocus_pending = false;
+            self.sync_visible_slots();
             return;
         };
 
+        let members = self.visible_members(next);
         for other in 0..self.managed_windows.len() {
-            if other != next {
+            if other != next && !members.contains(&other) {
                 self.hide_window(other);
             }
         }
 
         self.active = Some(next);
         self.touch_mru(next);
-        self.native_host_events
-            .active_pid
-            .store(self.managed_windows[next].pid, Ordering::Release);
-        self.native_host_events.active_hwnd.store(
-            self.managed_windows[next].hwnd.0 as isize,
-            Ordering::Release,
-        );
+        self.sync_visible_slots();
         self.bounds_dirty = false;
-        if !self.position_active_window() {
-            self.managed_windows[next].hide();
+        if self.position_visible_members() {
+            for &member in &members {
+                if member != next && self.managed_windows[member].is_open() {
+                    self.managed_windows[member].show_no_activate();
+                }
+            }
+        } else {
+            for &member in &members {
+                if self.managed_windows[member].is_open() {
+                    self.managed_windows[member].hide();
+                }
+            }
         }
 
         self.refocus_pending = false;
@@ -694,18 +1019,30 @@ impl App {
     }
 
     fn reactivate_active_window(&mut self) {
-        if !self.position_active_window() {
+        let Some(active) = self.active else {
+            return;
+        };
+
+        for member in self.visible_members(active) {
+            if member != active {
+                self.managed_windows[member].show_no_activate();
+            }
+        }
+
+        if !self.position_visible_members() {
             return;
         }
 
-        if let Some(active) = self.active {
-            self.managed_windows[active].activate();
-        }
+        self.managed_windows[active].activate();
     }
 
     fn close_managed_window(&mut self, index: usize) {
         if self.active == Some(index) {
             let _ = self.reconcile_move_lift();
+        }
+
+        if let Some(group_index) = self.group_of(index) {
+            self.groups.remove(group_index);
         }
 
         if let Some(managed) = self.managed_windows.get_mut(index) {
@@ -895,6 +1232,20 @@ impl App {
                 Err(error) => debug_log!("Could not register Ctrl+Alt+D: {error}"),
             }
         }
+
+        if !self.hotkey_group_registered {
+            match unsafe {
+                RegisterHotKey(
+                    None,
+                    GROUP_HOTKEY_ID,
+                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                    u32::from(VK_G.0),
+                )
+            } {
+                Ok(()) => self.hotkey_group_registered = true,
+                Err(error) => debug_log!("Could not register Ctrl+Alt+G: {error}"),
+            }
+        }
     }
 
     fn register_attach_hotkey(&mut self) {
@@ -939,6 +1290,11 @@ impl App {
         {
             self.hotkey_detach_registered = false;
         }
+        if self.hotkey_group_registered
+            && unsafe { UnregisterHotKey(None, GROUP_HOTKEY_ID) }.is_ok()
+        {
+            self.hotkey_group_registered = false;
+        }
     }
 
     fn update_hotkey_registration(&mut self) {
@@ -975,15 +1331,25 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, managed)| managed.is_open())
-            .map(|(index, managed)| TabModel {
-                guest_index: index,
-                title: managed.title.clone(),
-                active: self.active == Some(index),
+            .map(|(index, managed)| {
+                let group_id = self
+                    .groups
+                    .iter()
+                    .position(|group| group.members.contains(&index));
+                TabModel {
+                    guest_index: index,
+                    title: managed.title.clone(),
+                    active: self.active == Some(index),
+                    group_id,
+                    group_color: group_id.map(|id| self.groups[id].color),
+                }
             })
             .collect();
 
+        let divider = self.content_divider();
+
         if let (Some(window), Some(tab_bar)) = (&self.window, self.tab_bar.as_mut()) {
-            tab_bar.draw(window, &models);
+            tab_bar.draw(window, &models, divider);
         }
     }
 
@@ -1144,10 +1510,11 @@ impl App {
         }
 
         let host_hwnd = self.host_hwnd();
+        let partner = self.drag_partner_of(press.guest_index);
         let Some(tab_bar) = self.tab_bar.as_mut() else {
             return;
         };
-        if tab_bar.begin_drag(press.guest_index, press.x)
+        if tab_bar.begin_drag(press.guest_index, partner, press.x)
             && let Some(hwnd) = host_hwnd
         {
             unsafe {
@@ -1245,8 +1612,10 @@ impl App {
                 .collect();
         }
 
+        self.groups = remap_tab_groups(&self.groups, &new_index_of_old);
+
         debug_log!("Reordered tabs: {sequence:?}");
-        self.mark_dirty();
+        self.refresh_layout();
     }
 
     fn attach_window(&mut self, target_value: isize) {
@@ -1306,10 +1675,13 @@ impl App {
         self.managed_windows[index].activate();
         debug_log!("Detached {title} into a standalone window");
 
+        let had_groups = !self.groups.is_empty();
         self.compact_managed_windows(|existing, _| existing != index);
 
         if was_active {
             self.show_next_window_without_focus();
+        } else if had_groups {
+            self.refresh_layout();
         }
 
         self.update_host_title();
@@ -1344,12 +1716,7 @@ impl App {
                 self.active = Some(new_index_of_old[active]);
             } else {
                 self.active = None;
-                self.native_host_events
-                    .active_hwnd
-                    .store(0, Ordering::Release);
-                self.native_host_events
-                    .active_pid
-                    .store(0, Ordering::Release);
+                self.native_host_events.clear_visible();
             }
         }
 
@@ -1359,6 +1726,8 @@ impl App {
             .filter_map(|&index| new_index_of_old.get(index).copied())
             .filter(|&mapped| mapped != usize::MAX)
             .collect();
+
+        self.groups = remap_tab_groups(&self.groups, &new_index_of_old);
 
         if let Some(session) = &mut self.cycle {
             session.order = session
@@ -1381,16 +1750,53 @@ impl App {
     }
 
     fn prune_dead_guests(&mut self) -> bool {
+        let had_groups = !self.groups.is_empty();
         let active_died = self
             .active
             .is_some_and(|active| !self.managed_windows[active].is_open());
 
         let changed = self.compact_managed_windows(|_index, managed| managed.is_open());
-        if changed && active_died {
-            self.activate_next_window();
+        if changed {
+            if active_died {
+                self.activate_next_window();
+            } else if had_groups {
+                self.refresh_layout();
+            }
         }
 
         changed
+    }
+
+    fn sync_active_with_foreground(&mut self) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0.is_null()
+            || self.host_hwnd().is_some_and(|host| foreground == host)
+            || self
+                .managed_windows
+                .get(active)
+                .is_some_and(|managed| managed.is_open() && foreground == managed.hwnd)
+        {
+            return;
+        }
+
+        let member = self.visible_members(active).into_iter().find(|&member| {
+            self.managed_windows
+                .get(member)
+                .is_some_and(|managed| managed.is_open() && foreground == managed.hwnd)
+        });
+
+        if let Some(member) = member {
+            debug_log!("Focus moved to tab {} (pane click)", member + 1);
+            self.active = Some(member);
+            self.cycle = None;
+            self.touch_mru(member);
+            self.sync_visible_slots();
+            self.update_host_title();
+            self.mark_dirty();
+        }
     }
 
     fn housekeeping(&mut self) {
@@ -1486,7 +1892,7 @@ impl ApplicationHandler for App {
         self.register_attach_hotkey();
 
         debug_log!(
-            "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab, Ctrl+Shift+W closes the active tab, Ctrl+Alt+D detaches the active tab"
+            "Hotkeys active while Uvez is focused: Ctrl+Tab switches tabs, Ctrl+T opens a new tab, Ctrl+Shift+W closes the active tab, Ctrl+Alt+D detaches the active tab, Ctrl+Alt+G groups/ungroups it with the next tab"
         );
         debug_log!("Ctrl+Alt+A attaches the currently focused window as a new tab");
         self.update_hotkey_registration();
@@ -1503,12 +1909,8 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 let _ = self.reconcile_move_lift();
                 self.cycle = None;
-                self.native_host_events
-                    .active_hwnd
-                    .store(0, Ordering::Release);
-                self.native_host_events
-                    .active_pid
-                    .store(0, Ordering::Release);
+                self.native_host_events.clear_visible();
+                self.groups.clear();
                 self.active = None;
                 self.bounds_dirty = false;
                 self.refocus_pending = false;
@@ -1518,6 +1920,7 @@ impl ApplicationHandler for App {
                 self.attach_requested.store(0, Ordering::Release);
                 self.attach_target.store(0, Ordering::Release);
                 self.detach_requested.store(0, Ordering::Release);
+                self.group_requested.store(0, Ordering::Release);
                 self.close_all_managed_windows();
                 event_loop.exit();
             }
@@ -1569,7 +1972,9 @@ impl ApplicationHandler for App {
                 let collapse_threshold = self.tab_strip_height();
                 if size.width == 0 || (size.height as i32) <= collapse_threshold {
                     if let Some(active) = self.active {
-                        self.hide_window(active);
+                        for member in self.visible_members(active) {
+                            self.hide_window(member);
+                        }
                     }
                     self.bounds_dirty = false;
                     self.refocus_pending = false;
@@ -1640,6 +2045,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.sync_active_with_foreground();
+
         if self.cycle.is_some() && !Self::ctrl_held() {
             self.commit_tab_cycle();
         }
@@ -1654,7 +2061,7 @@ impl ApplicationHandler for App {
             .size_move_finished
             .swap(false, Ordering::AcqRel);
         let in_size_move = self.native_host_events.in_size_move.load(Ordering::Acquire);
-        let lift_pending = self.native_host_events.lifted_hwnd.load(Ordering::Acquire) != 0;
+        let lift_pending = self.native_host_events.has_lifted();
         let lift_released = if !in_size_move && (move_finished || lift_pending) {
             self.reconcile_move_lift()
         } else {
@@ -1721,6 +2128,16 @@ impl ApplicationHandler for App {
             self.detach_active_window();
         }
 
+        while self
+            .group_requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.toggle_group();
+        }
+
         if self.last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
             self.housekeeping();
         }
@@ -1744,12 +2161,7 @@ impl ApplicationHandler for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.reconcile_move_lift();
-        self.native_host_events
-            .active_hwnd
-            .store(0, Ordering::Release);
-        self.native_host_events
-            .active_pid
-            .store(0, Ordering::Release);
+        self.native_host_events.clear_visible();
         self.release_managed_windows();
         if self.hotkey_attach_registered {
             unsafe {
@@ -1764,7 +2176,17 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_remap_after_compact, tab_sequence_for_order};
+    use super::{
+        TabGroup, grouping_candidate, index_remap_after_compact, pane_rects, remap_tab_groups,
+        tab_sequence_for_order,
+    };
+
+    fn group(members: [usize; 2]) -> TabGroup {
+        TabGroup {
+            members,
+            color: 0x007AA2F7,
+        }
+    }
 
     #[test]
     fn identity_order_passes_through() {
@@ -1829,5 +2251,67 @@ mod tests {
             index_remap_after_compact(2, |_| false),
             vec![usize::MAX, usize::MAX]
         );
+    }
+
+    #[test]
+    fn single_pane_spans_full_content() {
+        let panes = pane_rects(10, 20, 300, 200, 8, 1);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].x, 10);
+        assert_eq!(panes[0].width, 300);
+    }
+
+    #[test]
+    fn two_panes_split_with_divider_gap() {
+        let panes = pane_rects(0, 0, 408, 100, 8, 2);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].x, 0);
+        assert_eq!(panes[0].width, 200);
+        assert_eq!(panes[1].x, 208);
+        assert_eq!(panes[1].width, 200);
+        assert_eq!(panes[1].height, 100);
+    }
+
+    #[test]
+    fn pane_split_is_empty_when_width_cannot_fit() {
+        assert!(pane_rects(0, 0, 4, 100, 8, 2).is_empty());
+        assert!(pane_rects(0, 0, 100, 0, 8, 1).is_empty());
+        assert!(pane_rects(0, 0, 100, 100, 8, 0).is_empty());
+    }
+
+    #[test]
+    fn grouping_candidate_prefers_mru_then_skips_grouped_and_closed() {
+        let is_open = |index: usize| index != 3;
+        let is_grouped = |index: usize| index == 2;
+
+        assert_eq!(
+            grouping_candidate(1, 4, &[2, 0, 3], is_open, |_| false),
+            Some(2)
+        );
+        assert_eq!(
+            grouping_candidate(1, 4, &[2, 0, 3], is_open, is_grouped),
+            Some(0)
+        );
+        let only_active_and_grouped = |index: usize| index == 0 || index == 2;
+        assert_eq!(
+            grouping_candidate(0, 4, &[2, 0], only_active_and_grouped, is_grouped),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_groups_survive_index_remaps_and_dissolve_on_member_loss() {
+        let groups = vec![group([0, 2]), group([1, 3])];
+
+        let identity = remap_tab_groups(&groups, &[0, 1, 2, 3]);
+        assert_eq!(identity.len(), 2);
+        assert_eq!(identity[0].members, [0, 2]);
+
+        let after_removal = remap_tab_groups(&groups, &[0, usize::MAX, 1, 2]);
+        assert_eq!(after_removal.len(), 1);
+        assert_eq!(after_removal[0].members, [0, 1]);
+
+        let stale = vec![group([0, 9])];
+        assert!(remap_tab_groups(&stale, &[0, 1]).is_empty());
     }
 }
