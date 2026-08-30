@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1605,6 +1605,28 @@ impl ApplicationHandler for App {
                 self.cursor_pos = None;
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.clear_hover();
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let Some((_, y)) = self.cursor_pos else {
+                    return;
+                };
+                if y >= self.tab_strip_height()
+                    || self.tab_bar.as_ref().is_some_and(TabBar::is_dragging)
+                {
+                    return;
+                }
+
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.y / (48.0 * self.scale_factor())) as f32
+                    }
+                };
+
+                if let Some(tab_bar) = self.tab_bar.as_mut() {
+                    tab_bar.scroll_by_wheel(lines);
                 }
             }
 
