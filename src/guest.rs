@@ -7,31 +7,35 @@ use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicIsize, Ordering};
+
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM,
+    CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, POINT, RECT, SetLastError, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::Shell::{
-    DefSubclassProc, RemoveWindowSubclass, SUBCLASSPROC, SetWindowSubclass,
-};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClassNameW,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST,
-    IsWindow, IsWindowVisible, PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX,
-    WINDOWPLACEMENT, WM_ACTIVATE, WM_APP, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
-    WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    BringWindowToTop, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, EnumWindows,
+    GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible,
+    PostMessageW, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT, WM_APP,
+    WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PWSTR, Result as WinResult};
 
 pub(crate) const WINDOW_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const GUEST_SUBCLASS_ID: usize = 2;
-const GUEST_SUBCLASS_PROC: SUBCLASSPROC = Some(guest_subclass_proc);
+
+static EVENT_HOST_WINDOW: AtomicIsize = AtomicIsize::new(0);
 pub(crate) const MANAGED_STYLE_MASK: u32 =
     WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0;
 pub(crate) const MANAGED_EX_STYLE_MASK: u32 = WS_EX_DLGMODALFRAME.0
@@ -67,6 +71,13 @@ pub(crate) struct ManagedWindow {
     original_placement: WINDOWPLACEMENT,
     originally_visible: bool,
     managed_mode: bool,
+    location_hook: usize,
+}
+
+impl Drop for ManagedWindow {
+    fn drop(&mut self) {
+        self.unhook_location_watch();
+    }
 }
 
 pub(crate) type ManagedWindowArrival = std::result::Result<DiscoveredWindow, String>;
@@ -98,6 +109,7 @@ impl DiscoveredWindow {
             original_placement: self.original_placement,
             originally_visible: self.originally_visible,
             managed_mode: false,
+            location_hook: 0,
         }
     }
 }
@@ -157,26 +169,112 @@ fn set_window_owner(hwnd: HWND, owner: isize) -> Result<(), String> {
     }
 }
 
-unsafe extern "system" fn guest_subclass_proc(
+unsafe extern "system" fn guest_event_callback(
+    _hook: HWINEVENTHOOK,
+    event: u32,
     hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _subclass_id: usize,
-    reference_data: usize,
-) -> LRESULT {
-    if message == WM_ACTIVATE && reference_data != 0 && (wparam.0 & 0xFFFF) as u16 != 0 {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(reference_data as *mut c_void)),
-                WM_APP,
-                WPARAM(hwnd.0 as usize),
-                LPARAM(0),
-            );
-        }
+    id_object: i32,
+    id_child: i32,
+    _thread_id: u32,
+    _event_time: u32,
+) {
+    if id_object != 0 || id_child != 0 {
+        return;
     }
 
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    let host = EVENT_HOST_WINDOW.load(Ordering::Acquire);
+    if host == 0 {
+        return;
+    }
+
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(host as *mut c_void)),
+            WM_APP,
+            WPARAM(hwnd.0 as usize),
+            LPARAM(event as isize),
+        );
+    }
+}
+
+pub(crate) fn install_location_watch(pid: u32) -> usize {
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(guest_event_callback),
+            pid,
+            0,
+            0,
+        )
+    };
+    if hook.is_invalid() {
+        0
+    } else {
+        hook.0 as usize
+    }
+}
+
+pub(crate) fn install_foreground_watch() -> usize {
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(guest_event_callback),
+            0,
+            0,
+            0,
+        )
+    };
+    if hook.is_invalid() {
+        0
+    } else {
+        hook.0 as usize
+    }
+}
+
+pub(crate) fn unhook_win_event(hook: usize) {
+    if hook != 0 {
+        unsafe {
+            let _ = UnhookWinEvent(HWINEVENTHOOK(hook as *mut c_void));
+        }
+    }
+}
+
+pub(crate) fn work_area_at_cursor() -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_err() {
+            return None;
+        }
+
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+
+        let work = info.rcWork;
+        Some((
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+        ))
+    }
+}
+
+pub(crate) fn set_event_host_window(hwnd: Option<isize>) {
+    EVENT_HOST_WINDOW.store(hwnd.unwrap_or(0), Ordering::Release);
 }
 
 impl ManagedWindow {
@@ -259,16 +357,11 @@ impl ManagedWindow {
             originally_visible: self.originally_visible,
         });
 
-        let installed = unsafe {
-            SetWindowSubclass(
-                self.hwnd,
-                GUEST_SUBCLASS_PROC,
-                GUEST_SUBCLASS_ID,
-                owner.0 as usize,
-            )
-        };
-        if !installed.as_bool() {
-            debug_log!("Could not observe focus changes for {}", self.title);
+        let installed = install_location_watch(self.pid);
+        if installed == 0 {
+            debug_log!("Could not observe location changes for {}", self.title);
+        } else {
+            self.location_hook = installed;
         }
 
         Ok(())
@@ -281,6 +374,7 @@ impl ManagedWindow {
 
         if !self.is_open() {
             self.managed_mode = false;
+            self.unhook_location_watch();
             unregister_panic_restore(self.hwnd);
             return Ok(());
         }
@@ -340,9 +434,7 @@ impl ManagedWindow {
 
         if restore_result.is_ok() {
             self.managed_mode = false;
-            unsafe {
-                let _ = RemoveWindowSubclass(self.hwnd, GUEST_SUBCLASS_PROC, GUEST_SUBCLASS_ID);
-            }
+            self.unhook_location_watch();
             unregister_panic_restore(self.hwnd);
             unsafe {
                 let command = if self.originally_visible {
@@ -368,6 +460,13 @@ impl ManagedWindow {
                 bounds.height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
+        }
+    }
+
+    fn unhook_location_watch(&mut self) {
+        if self.location_hook != 0 {
+            unhook_win_event(self.location_hook);
+            self.location_hook = 0;
         }
     }
 

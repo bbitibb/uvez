@@ -16,7 +16,7 @@ use crate::tabbar::{
     COLOR_BORDER_ACTIVE, COLOR_BORDER_INACTIVE, ContentDivider, Hit, TAB_BAR_HEIGHT_LOGICAL,
     TAB_BORDER_WIDTH, TabBar, TabModel,
 };
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DwmSetWindowAttribute,
@@ -28,11 +28,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HWND_TOP, MB_ICONERROR, MessageBoxW, PostMessageW, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_CLOSE,
+    GetForegroundWindow, GetWindowRect, HWND_TOP, MB_ICONERROR, MessageBoxW, PostMessageW,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_CLOSE,
 };
 use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -60,6 +61,12 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
 const KEY_PRESSED: u16 = 0x8000;
 const TAB_DRAG_THRESHOLD_LOGICAL: f64 = 6.0;
+const HOST_WIDTH_RATIO: f64 = 0.5;
+const HOST_HEIGHT_RATIO: f64 = 0.6;
+const HOST_MAX_WIDTH: i32 = 1120;
+const HOST_MAX_HEIGHT: i32 = 740;
+const HOST_MIN_WIDTH: i32 = 700;
+const HOST_MIN_HEIGHT: i32 = 480;
 
 struct CycleSession {
     order: Vec<usize>,
@@ -250,6 +257,7 @@ pub(crate) struct App {
     group_requested: Arc<AtomicU32>,
     groups: Vec<TabGroup>,
     palette_cursor: usize,
+    foreground_hook: usize,
     native_host_events: Arc<NativeHostEvents>,
     host_subclass_reference: Option<usize>,
     lift_release_attempts: u8,
@@ -300,6 +308,7 @@ impl App {
             group_requested,
             groups: Vec::new(),
             palette_cursor: 0,
+            foreground_hook: 0,
             native_host_events: Arc::new(NativeHostEvents::default()),
             host_subclass_reference: None,
             lift_release_attempts: 0,
@@ -1799,6 +1808,62 @@ impl App {
         }
     }
 
+    fn sync_host_with_guests(&mut self) {
+        if self.native_host_events.in_size_move.load(Ordering::Acquire) {
+            return;
+        }
+
+        let Some(active) = self.active else {
+            return;
+        };
+        if !self
+            .managed_windows
+            .get(active)
+            .is_some_and(ManagedWindow::is_open)
+        {
+            return;
+        }
+
+        let Some(rects) = self.layout_rects() else {
+            return;
+        };
+        let Some((_, expected)) = rects.iter().find(|(index, _)| *index == active) else {
+            return;
+        };
+
+        let managed = &self.managed_windows[active];
+        let mut actual = RECT::default();
+        if unsafe { GetWindowRect(managed.hwnd, &mut actual) }.is_err() {
+            return;
+        }
+
+        let dx = actual.left - expected.x;
+        let dy = actual.top - expected.y;
+        let size_changed = (actual.right - actual.left) != expected.width
+            || (actual.bottom - actual.top) != expected.height;
+
+        if dx == 0 && dy == 0 {
+            if size_changed {
+                self.bounds_dirty = true;
+            }
+            return;
+        }
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Ok(host_position) = window.inner_position() else {
+            return;
+        };
+
+        debug_log!("Guest moved externally by ({dx}, {dy}); moving the host along");
+        window.set_outer_position(PhysicalPosition::new(
+            host_position.x + dx,
+            host_position.y + dy,
+        ));
+        self.bounds_dirty = true;
+    }
+
     fn housekeeping(&mut self) {
         self.last_housekeeping = Instant::now();
 
@@ -1845,8 +1910,29 @@ impl ApplicationHandler for App {
         let mut attributes = Window::default_attributes()
             .with_title("Uvez")
             .with_window_icon(icon::window_icon());
+
+        if let Some((x, y, work_width, work_height)) = guest::work_area_at_cursor() {
+            let width = ((work_width as f64 * HOST_WIDTH_RATIO) as i32).clamp(
+                HOST_MIN_WIDTH,
+                HOST_MAX_WIDTH.min(work_width.max(HOST_MIN_WIDTH)),
+            );
+            let height = ((work_height as f64 * HOST_HEIGHT_RATIO) as i32).clamp(
+                HOST_MIN_HEIGHT,
+                HOST_MAX_HEIGHT.min(work_height.max(HOST_MIN_HEIGHT)),
+            );
+            attributes = attributes
+                .with_inner_size(PhysicalSize::new(width as u32, height as u32))
+                .with_position(PhysicalPosition::new(
+                    x + (work_width - width) / 2,
+                    y + (work_height - height) / 2,
+                ));
+        }
+
         attributes = attributes.with_taskbar_icon(icon::taskbar_icon());
         self.window = Some(Arc::new(event_loop.create_window(attributes).unwrap()));
+
+        self.foreground_hook = guest::install_foreground_watch();
+        guest::set_event_host_window(self.host_hwnd().map(|hwnd| hwnd.0 as isize));
 
         if let Err(error) = self.install_host_subclass() {
             debug_log!("Could not initialize native host synchronization: {error}");
@@ -2046,6 +2132,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.sync_active_with_foreground();
+        self.sync_host_with_guests();
 
         if self.cycle.is_some() && !Self::ctrl_held() {
             self.commit_tab_cycle();
@@ -2162,6 +2249,9 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.reconcile_move_lift();
         self.native_host_events.clear_visible();
+        guest::unhook_win_event(self.foreground_hook);
+        self.foreground_hook = 0;
+        guest::set_event_host_window(None);
         self.release_managed_windows();
         if self.hotkey_attach_registered {
             unsafe {
