@@ -83,5 +83,4 @@ When reporting a bug, attach that log file.
 ## Roadmap
 
 - [ ] TOML configuration file for custom app launch profiles and args
-- [ ] Detach tabs back into standalone windows on demand
-- [ ] Attach already-running windows by PID / title
+
