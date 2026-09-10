@@ -1,19 +1,28 @@
 use crate::debug_log;
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic;
 use std::path::Path;
-use std::process::Command;
-use std::sync::{Mutex, MutexGuard, mpsc};
+use std::process::{Child, Command};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GUI_INMOVESIZE, GUITHREADINFO, GetGUIThreadInfo};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
+};
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, GetLastError, HWND, LPARAM, POINT, RECT, SetLastError, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, SetWindowRgn,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -34,6 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PWSTR, Result as WinResult};
 
 pub(crate) const WINDOW_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_SETTLE_TIME: Duration = Duration::from_millis(100);
 
 static EVENT_HOST_WINDOW: AtomicIsize = AtomicIsize::new(0);
 pub(crate) const MANAGED_STYLE_MASK: u32 =
@@ -51,12 +61,21 @@ pub(crate) struct WindowInfo {
     pub(crate) pid: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WindowBounds {
     pub(crate) x: i32,
     pub(crate) y: i32,
     pub(crate) width: i32,
     pub(crate) height: i32,
+}
+
+impl WindowBounds {
+    fn matches(self, rect: RECT) -> bool {
+        rect.left == self.x
+            && rect.top == self.y
+            && rect.right - rect.left == self.width
+            && rect.bottom - rect.top == self.height
+    }
 }
 
 pub(crate) struct ManagedWindow {
@@ -72,6 +91,7 @@ pub(crate) struct ManagedWindow {
     originally_visible: bool,
     managed_mode: bool,
     location_hook: usize,
+    startup_cover: Option<StartupCover>,
 }
 
 impl Drop for ManagedWindow {
@@ -93,10 +113,15 @@ pub(crate) struct DiscoveredWindow {
     original_rect: RECT,
     original_placement: WINDOWPLACEMENT,
     originally_visible: bool,
+    pending_launch: Option<PendingLaunch>,
+    startup_cover: Option<StartupCover>,
 }
 
 impl DiscoveredWindow {
-    pub(crate) fn into_managed_window(self) -> ManagedWindow {
+    pub(crate) fn into_managed_window(mut self) -> ManagedWindow {
+        if let Some(launch) = &mut self.pending_launch {
+            launch.0.take();
+        }
         ManagedWindow {
             hwnd: HWND(self.hwnd as *mut c_void),
             pid: self.pid,
@@ -110,8 +135,70 @@ impl DiscoveredWindow {
             originally_visible: self.originally_visible,
             managed_mode: false,
             location_hook: 0,
+            startup_cover: self.startup_cover,
         }
     }
+}
+
+struct PendingLaunch(Option<Child>);
+
+impl Drop for PendingLaunch {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0
+            && child.kill().is_ok()
+        {
+            let _ = child.wait();
+        }
+    }
+}
+
+struct StartupCover {
+    hwnd: isize,
+    pid: u32,
+    bounds: Cell<Option<WindowBounds>>,
+    stable_since: Cell<Option<Instant>>,
+}
+
+impl StartupCover {
+    fn new(hwnd: HWND, pid: u32) -> Result<Self, String> {
+        unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            if region.is_invalid() {
+                return Err("could not create terminal startup mask".into());
+            }
+            if SetWindowRgn(hwnd, Some(region), true) == 0 {
+                let _ = DeleteObject(region.into());
+                return Err("could not mask terminal startup".into());
+            }
+        }
+        Ok(Self {
+            hwnd: hwnd.0 as isize,
+            pid,
+            bounds: Cell::new(None),
+            stable_since: Cell::new(None),
+        })
+    }
+}
+
+impl Drop for StartupCover {
+    fn drop(&mut self) {
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        if get_window_process_id(hwnd) == self.pid {
+            unsafe {
+                SetWindowRgn(hwnd, None, true);
+            }
+        }
+    }
+}
+
+fn startup_ready(stable_since: &Cell<Option<Instant>>, aligned: bool, now: Instant) -> bool {
+    if !aligned {
+        stable_since.set(None);
+        return false;
+    }
+    let since = stable_since.get().unwrap_or(now);
+    stable_since.set(Some(since));
+    now.duration_since(since) >= STARTUP_SETTLE_TIME
 }
 
 fn get_window_attribute(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> Result<u32, String> {
@@ -283,6 +370,20 @@ impl ManagedWindow {
         exists && get_window_process_id(self.hwnd) == self.pid
     }
 
+    pub(crate) fn is_in_move_size(&self) -> bool {
+        let thread = unsafe { GetWindowThreadProcessId(self.hwnd, None) };
+        if thread == 0 {
+            return false;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+            && info.flags.contains(GUI_INMOVESIZE)
+            && info.hwndMoveSize == self.hwnd
+    }
+
     pub(crate) fn enter_managed_mode(&mut self, owner: HWND) -> Result<(), String> {
         if self.managed_mode {
             return Ok(());
@@ -355,6 +456,7 @@ impl ManagedWindow {
             original_placement: self.original_placement,
             originally_topmost: self.original_ex_style & WS_EX_TOPMOST.0 != 0,
             originally_visible: self.originally_visible,
+            startup_masked: self.startup_cover.is_some(),
         });
 
         let installed = install_location_watch(self.pid);
@@ -380,6 +482,8 @@ impl ManagedWindow {
         }
 
         self.hide();
+
+        self.startup_cover.take();
 
         let current_style =
             get_window_attribute(self.hwnd, GWL_STYLE).unwrap_or(self.original_style);
@@ -450,6 +554,14 @@ impl ManagedWindow {
     }
 
     pub(crate) fn position(&self, bounds: WindowBounds) -> WinResult<()> {
+        if let Some(cover) = &self.startup_cover {
+            let mut rect = RECT::default();
+            let already_aligned =
+                unsafe { GetWindowRect(self.hwnd, &mut rect) }.is_ok() && bounds.matches(rect);
+            if cover.bounds.replace(Some(bounds)) != Some(bounds) || !already_aligned {
+                cover.stable_since.set(None);
+            }
+        }
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -461,6 +573,35 @@ impl ManagedWindow {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
         }
+    }
+
+    pub(crate) fn finish_startup(&mut self) -> bool {
+        let Some(cover) = &self.startup_cover else {
+            return false;
+        };
+        if !self.is_open() || !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            cover.stable_since.set(None);
+            return false;
+        }
+        let mut rect = RECT::default();
+        let matches = unsafe { GetWindowRect(self.hwnd, &mut rect) }.is_ok()
+            && cover
+                .bounds
+                .get()
+                .is_some_and(|bounds| bounds.matches(rect));
+        let ready = startup_ready(&cover.stable_since, matches, Instant::now());
+        if !matches {
+            cover.stable_since.set(None);
+            if let Some(bounds) = cover.bounds.get() {
+                let _ = self.position(bounds);
+            }
+            return true;
+        }
+        if !ready {
+            return true;
+        }
+        self.startup_cover.take();
+        false
     }
 
     fn unhook_location_watch(&mut self) {
@@ -530,30 +671,38 @@ impl ManagedWindow {
     }
 }
 
+struct WindowSearch {
+    pid: u32,
+    found: Option<WindowInfo>,
+}
+
 unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let windows = lparam.0 as *mut Vec<WindowInfo>;
+    let search = unsafe { &mut *(lparam.0 as *mut WindowSearch) };
 
     unsafe {
-        let title = get_window_title(hwnd);
         let pid = get_window_process_id(hwnd);
-
-        if !title.is_empty() && IsWindowVisible(hwnd).as_bool() {
-            (&mut *windows).push(WindowInfo { hwnd, title, pid });
+        if search.found.is_none() && pid == search.pid && IsWindowVisible(hwnd).as_bool() {
+            let title = get_window_title(hwnd);
+            if !title.is_empty() {
+                search.found = Some(WindowInfo { hwnd, title, pid });
+            }
         }
     }
 
     BOOL(1)
 }
 
-pub(crate) fn get_all_windows() -> WinResult<Vec<WindowInfo>> {
-    let mut windows = Vec::new();
-    let windows_ptr: *mut Vec<WindowInfo> = &mut windows;
+fn find_process_window(pid: u32) -> WinResult<Option<WindowInfo>> {
+    let mut search = WindowSearch { pid, found: None };
 
     unsafe {
-        EnumWindows(Some(enum_callback), LPARAM(windows_ptr as isize))?;
+        EnumWindows(
+            Some(enum_callback),
+            LPARAM(&mut search as *mut WindowSearch as isize),
+        )?;
     }
 
-    Ok(windows)
+    Ok(search.found)
 }
 
 pub(crate) fn get_window_process_id(hwnd: HWND) -> u32 {
@@ -665,11 +814,8 @@ pub(crate) fn get_window_title(hwnd: HWND) -> String {
     }
 }
 
-fn launch_process(process_name: &str, args: &[String]) -> std::io::Result<u32> {
-    Command::new(process_name)
-        .args(args)
-        .spawn()
-        .map(|child| child.id())
+fn launch_process(process_name: &str, args: &[String]) -> std::io::Result<Child> {
+    Command::new(process_name).args(args).spawn()
 }
 
 struct RestoreRecord {
@@ -681,6 +827,7 @@ struct RestoreRecord {
     original_placement: WINDOWPLACEMENT,
     originally_topmost: bool,
     originally_visible: bool,
+    startup_masked: bool,
 }
 
 static RESTORE_REGISTRY: Mutex<Vec<RestoreRecord>> = Mutex::new(Vec::new());
@@ -734,6 +881,9 @@ fn restore_record(record: &RestoreRecord) {
     };
 
     unsafe {
+        if record.startup_masked {
+            let _ = SetWindowRgn(hwnd, None, false);
+        }
         let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, record.original_style as isize);
         let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, record.original_ex_style as isize);
         let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, record.original_owner);
@@ -775,12 +925,20 @@ pub(crate) fn request_managed_window(
     args: &[&str],
     sender: mpsc::Sender<ManagedWindowArrival>,
     host_hwnd: Option<isize>,
-) {
+) -> LaunchRequest {
     let process_name = process_name.to_string();
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
 
-    thread::spawn(move || {
-        let arrival = discover_managed_window(&process_name, &args);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker = thread::spawn(move || {
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let arrival = discover_managed_window(&process_name, &args, host_hwnd, &worker_cancelled);
+        if worker_cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let _ = sender.send(arrival);
 
         if let Some(hwnd) = host_hwnd {
@@ -794,18 +952,130 @@ pub(crate) fn request_managed_window(
             }
         }
     });
+    LaunchRequest {
+        cancelled,
+        worker: Some(worker),
+    }
 }
 
-fn discover_managed_window(process_name: &str, args: &[String]) -> ManagedWindowArrival {
-    let pid = launch_process(process_name, args)
+pub(crate) struct LaunchRequest {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LaunchRequest {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for LaunchRequest {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn alacritty_launch_args(args: &[String], desktop_right: i32, desktop_top: i32) -> Vec<String> {
+    let command = args
+        .iter()
+        .position(|arg| arg == "-e" || arg == "--command" || arg.starts_with("--command="))
+        .unwrap_or(args.len());
+    let mut launch_args = args[..command].to_vec();
+    for option in [
+        format!(
+            "window.position={{x={},y={}}}",
+            desktop_right.saturating_add(128),
+            desktop_top.saturating_add(128)
+        ),
+        "window.startup_mode=\"Windowed\"".to_string(),
+    ] {
+        launch_args.push("--option".to_string());
+        launch_args.push(option);
+    }
+    launch_args.extend_from_slice(&args[command..]);
+    launch_args
+}
+
+fn discover_managed_window(
+    process_name: &str,
+    args: &[String],
+    host_hwnd: Option<isize>,
+    cancelled: &AtomicBool,
+) -> ManagedWindowArrival {
+    let offscreen_launch = Path::new(process_name)
+        .file_stem()
+        .is_some_and(|name| name.eq_ignore_ascii_case("alacritty"));
+    let restore_placement = if offscreen_launch {
+        let host = host_hwnd
+            .map(|value| HWND(value as *mut c_void))
+            .ok_or("cannot stage a terminal without a host window")?;
+        let mut rect = RECT::default();
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            GetWindowRect(host, &mut rect)
+                .map_err(|error| format!("could not read host bounds: {error}"))?;
+            GetWindowPlacement(host, &mut placement)
+                .map_err(|error| format!("could not read host placement: {error}"))?;
+        }
+        placement.showCmd = SW_SHOWNORMAL.0 as u32;
+        placement.flags = Default::default();
+        Some((rect, placement))
+    } else {
+        None
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return Err("terminal launch cancelled".into());
+    }
+    let launch_args = if offscreen_launch {
+        let (right, top) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN)
+                    .saturating_add(GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            )
+        };
+        alacritty_launch_args(args, right, top)
+    } else {
+        args.to_vec()
+    };
+    let child = launch_process(process_name, &launch_args)
         .map_err(|error| format!("failed to launch {process_name}: {error}"))?;
+    let pid = child.id();
+    let pending_launch = if offscreen_launch {
+        Some(PendingLaunch(Some(child)))
+    } else {
+        None
+    };
     let deadline = Instant::now() + WINDOW_DISCOVERY_TIMEOUT;
 
     while Instant::now() < deadline {
-        let windows =
-            get_all_windows().map_err(|error| format!("failed to enumerate windows: {error}"))?;
-        if let Some(info) = windows.into_iter().find(|window| window.pid == pid) {
-            return capture_window_state(info, process_name);
+        if cancelled.load(Ordering::Acquire) {
+            return Err("terminal launch cancelled".into());
+        }
+        let info = find_process_window(pid)
+            .map_err(|error| format!("failed to enumerate windows: {error}"))?;
+        if let Some(info) = info {
+            let cover = if offscreen_launch {
+                Some(StartupCover::new(info.hwnd, pid)?)
+            } else {
+                None
+            };
+            let mut discovered = capture_window_state(info, process_name)?;
+            discovered.pending_launch = pending_launch;
+            discovered.startup_cover = cover;
+            if let Some((rect, placement)) = restore_placement {
+                discovered.original_rect = rect;
+                discovered.original_placement = placement;
+            }
+            return Ok(discovered);
         }
 
         thread::sleep(Duration::from_millis(15));
@@ -854,6 +1124,8 @@ fn capture_window_state(info: WindowInfo, fallback_exe: &str) -> ManagedWindowAr
         original_rect,
         original_placement,
         originally_visible,
+        pending_launch: None,
+        startup_cover: None,
     })
 }
 
@@ -908,7 +1180,67 @@ fn adopt_existing_window(hwnd_value: isize) -> ManagedWindowArrival {
 
 #[cfg(test)]
 mod tests {
-    use super::format_title;
+    use super::{STARTUP_SETTLE_TIME, alacritty_launch_args, format_title, startup_ready};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn alacritty_starts_beyond_the_entire_desktop_in_windowed_mode() {
+        assert_eq!(
+            alacritty_launch_args(&[], 5120, -1440),
+            [
+                "--option",
+                "window.position={x=5248,y=-1312}",
+                "--option",
+                "window.startup_mode=\"Windowed\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn staging_overrides_follow_config_options_but_precede_the_command() {
+        for command in ["-e", "--command", "--command=pwsh"] {
+            let args: Vec<String> = [
+                "--option",
+                "window.startup_mode=\"Maximized\"",
+                command,
+                "pwsh",
+                "--option",
+                "child-argument",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            let launch = alacritty_launch_args(&args, 1920, 0);
+            assert_eq!(&launch[..2], &args[..2]);
+            assert_eq!(&launch[6..], &args[2..]);
+            assert_eq!(launch[5], "window.startup_mode=\"Windowed\"");
+        }
+    }
+
+    #[test]
+    fn startup_waits_for_a_stable_visible_placement() {
+        let state = Cell::new(None);
+        let start = Instant::now();
+        assert!(!startup_ready(&state, false, start));
+        assert!(!startup_ready(&state, true, start));
+        assert!(!startup_ready(
+            &state,
+            true,
+            start + STARTUP_SETTLE_TIME - Duration::from_millis(1)
+        ));
+        assert!(startup_ready(&state, true, start + STARTUP_SETTLE_TIME));
+    }
+
+    #[test]
+    fn hiding_or_startup_drift_restarts_the_settle_period() {
+        let state = Cell::new(None);
+        let start = Instant::now();
+        assert!(!startup_ready(&state, true, start));
+        assert!(!startup_ready(&state, false, start + STARTUP_SETTLE_TIME));
+        assert!(!startup_ready(&state, true, start + STARTUP_SETTLE_TIME));
+        assert!(startup_ready(&state, true, start + STARTUP_SETTLE_TIME * 2));
+    }
 
     #[test]
     fn plain_title_passes_through() {

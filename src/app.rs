@@ -24,12 +24,13 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
     RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_A, VK_CONTROL, VK_D, VK_G,
-    VK_LBUTTON, VK_T, VK_TAB, VK_W,
+    VK_LBUTTON, VK_LWIN, VK_RWIN, VK_T, VK_TAB, VK_W,
 };
 use windows::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, HWND_TOP, MB_ICONERROR, MessageBoxW, PostMessageW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_CLOSE,
+    GetForegroundWindow, GetWindowRect, HWND_TOP, IsIconic, MB_ICONERROR, MessageBoxW,
+    PostMessageW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetWindowPos, WM_CLOSE,
 };
 use windows::core::{HSTRING, PCWSTR};
 use winit::application::ApplicationHandler;
@@ -269,6 +270,7 @@ pub(crate) struct App {
     hotkey_attach_registered: bool,
     arrival_tx: mpsc::Sender<guest::ManagedWindowArrival>,
     arrival_rx: mpsc::Receiver<guest::ManagedWindowArrival>,
+    pending_launches: Vec<guest::LaunchRequest>,
     startup_spawns_pending: usize,
     tab_bar: Option<TabBar>,
     cursor_pos: Option<(i32, i32)>,
@@ -320,6 +322,7 @@ impl App {
             hotkey_attach_registered: false,
             arrival_tx,
             arrival_rx,
+            pending_launches: Vec::new(),
             startup_spawns_pending: 0,
             tab_bar: None,
             cursor_pos: None,
@@ -1182,7 +1185,12 @@ impl App {
 
     fn spawn_new_tab(&mut self) {
         let host_hwnd = self.host_hwnd().map(|hwnd| hwnd.0 as isize);
-        guest::request_managed_window("alacritty.exe", &[], self.arrival_tx.clone(), host_hwnd);
+        self.pending_launches.push(guest::request_managed_window(
+            "alacritty.exe",
+            &[],
+            self.arrival_tx.clone(),
+            host_hwnd,
+        ));
     }
 
     fn register_hotkeys(&mut self) {
@@ -1809,7 +1817,11 @@ impl App {
     }
 
     fn sync_host_with_guests(&mut self) {
-        if self.native_host_events.in_size_move.load(Ordering::Acquire) {
+        if self.native_host_events.in_size_move.load(Ordering::Acquire)
+            || self
+                .host_hwnd()
+                .is_some_and(|hwnd| unsafe { IsIconic(hwnd) }.as_bool())
+        {
             return;
         }
 
@@ -1832,6 +1844,9 @@ impl App {
         };
 
         let managed = &self.managed_windows[active];
+        if unsafe { IsIconic(managed.hwnd) }.as_bool() {
+            return;
+        }
         let mut actual = RECT::default();
         if unsafe { GetWindowRect(managed.hwnd, &mut actual) }.is_err() {
             return;
@@ -1849,14 +1864,27 @@ impl App {
             return;
         }
 
+        let windows_key_held = unsafe {
+            (GetAsyncKeyState(i32::from(VK_LWIN.0)) as u16
+                | GetAsyncKeyState(i32::from(VK_RWIN.0)) as u16)
+                & KEY_PRESSED
+                != 0
+        };
+        let user_moving = managed.is_in_move_size()
+            || (windows_key_held && unsafe { GetForegroundWindow() } == managed.hwnd);
+        if !user_moving || self.bounds_dirty {
+            self.bounds_dirty = true;
+            return;
+        }
+
         let Some(window) = &self.window else {
             return;
         };
-        let Ok(host_position) = window.inner_position() else {
+        let Ok(host_position) = window.outer_position() else {
             return;
         };
 
-        debug_log!("Guest moved externally by ({dx}, {dy}); moving the host along");
+        debug_log!("Guest moved by the user by ({dx}, {dy}); moving the host along");
         window.set_outer_position(PhysicalPosition::new(
             host_position.x + dx,
             host_position.y + dy,
@@ -1888,13 +1916,7 @@ impl App {
             self.mark_dirty();
         }
 
-        let active_died = self
-            .active
-            .is_some_and(|active| !self.managed_windows[active].is_open());
-
-        if self.prune_dead_guests() && active_died {
-            self.activate_next_window();
-        }
+        self.prune_dead_guests();
 
         self.update_hotkey_registration();
         self.sync_tab_bar_focus();
@@ -2131,6 +2153,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.pending_launches
+            .retain(|request| !request.is_finished());
         self.sync_active_with_foreground();
         self.sync_host_with_guests();
 
@@ -2240,6 +2264,16 @@ impl ApplicationHandler for App {
             self.refocus_pending = false;
         }
 
+        let mut startup_pending = false;
+        for managed in &mut self.managed_windows {
+            startup_pending |= managed.finish_startup();
+        }
+        if startup_pending && self.cycle.is_none() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
+        }
+
         let wants_redraw = self.tab_bar.as_mut().is_some_and(TabBar::take_dirty);
         if wants_redraw && let Some(window) = &self.window {
             window.request_redraw();
@@ -2247,6 +2281,8 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.pending_launches.clear();
+        while self.arrival_rx.try_recv().is_ok() {}
         let _ = self.reconcile_move_lift();
         self.native_host_events.clear_visible();
         guest::unhook_win_event(self.foreground_hook);

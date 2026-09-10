@@ -15,7 +15,6 @@
   </desc>
 
   <defs>
-    <!-- Open the line at each crossing so the strand visibly weaves. -->
     <mask id="uvez-weave" x="0" y="0" width="56" height="56" maskUnits="userSpaceOnUse">
       <rect width="56" height="56" fill="white" />
       <circle cx="28" cy="11.5" r="2.35" fill="black" />
@@ -24,7 +23,6 @@
     </mask>
   </defs>
 
-  <!-- One unbroken trefoil: three parts held by a single binding line. -->
   <polyline
     points="28.00,31.50 33.19,31.02 38.07,29.63 42.38,27.42 45.86,24.57 48.32,21.29 49.66,17.84 49.80,14.49 48.78,11.50 46.70,9.12 43.73,7.57 40.07,7.00 36.00,7.50 31.79,9.09 27.73,11.71 24.08,15.25 21.07,19.50 18.89,24.23 17.66,29.16 17.42,33.99 18.14,38.43 19.75,42.20 22.07,45.08 24.90,46.89 28.00,47.50 31.10,46.89 33.93,45.08 36.25,42.20 37.86,38.43 38.58,33.99 38.34,29.16 37.11,24.23 34.93,19.50 31.92,15.25 28.27,11.71 24.21,9.09 20.00,7.50 15.93,7.00 12.27,7.57 9.30,9.12 7.22,11.50 6.20,14.49 6.34,17.84 7.68,21.29 10.14,24.57 13.62,27.42 17.93,29.63 22.81,31.02 28.00,31.50"
     stroke="currentColor"
@@ -34,7 +32,6 @@
     mask="url(#uvez-weave)"
   />
 
-  <!-- The three overpasses complete the knot without adding another shape. -->
   <g
     stroke="currentColor"
     stroke-width="1.8"

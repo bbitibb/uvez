@@ -20,7 +20,7 @@ const COLOR_TAB_ACTIVE: u32 = 0x001F2335;
 const COLOR_ACCENT: u32 = 0x007AA2F7;
 const COLOR_SEPARATOR: u32 = 0x00232433;
 const COLOR_TEXT: u32 = 0x00C0CAF5;
-const COLOR_TEXT_DIM: u32 = 0x00565F89;
+const COLOR_TEXT_DIM: u32 = 0x00828DB5;
 const COLOR_CLOSE_BG: u32 = 0x002A2E42;
 const COLOR_CLOSE_GLYPH: u32 = 0x00F7768E;
 const COLOR_WINDOW_CLOSE_BG: u32 = 0x00C42B1C;
@@ -182,6 +182,7 @@ pub(crate) struct TabBar {
     first_visible: usize,
     scroll_carry: f32,
     revealed_active: Option<usize>,
+    revealed_capacity: usize,
     group_member_pairs: Vec<(usize, usize)>,
 }
 
@@ -241,6 +242,7 @@ impl TabBar {
             first_visible: 0,
             scroll_carry: 0.0,
             revealed_active: None,
+            revealed_capacity: 0,
             group_member_pairs: Vec::new(),
         })
     }
@@ -565,7 +567,7 @@ impl TabBar {
             };
 
             let step = tab_width + gap;
-            let view_width = (view_right - origin_x).max(0);
+            let view_width = (view_right - origin_x - button_space).max(0);
             let visible_count = if step > 0 {
                 ((view_width + gap) / step).max(0) as usize
             } else {
@@ -605,8 +607,9 @@ impl TabBar {
                 .iter()
                 .find(|model| model.active)
                 .map(|model| model.guest_index);
-            if active_guest != self.revealed_active {
+            if active_guest != self.revealed_active || visible_count != self.revealed_capacity {
                 self.revealed_active = active_guest;
+                self.revealed_capacity = visible_count;
                 if let Some(guest) = active_guest
                     && let Some(slot) = order.iter().position(|&g| g == guest)
                     && visible_count > 0
