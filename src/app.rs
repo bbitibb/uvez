@@ -39,7 +39,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{Cursor, CursorIcon, Window, WindowId};
 
 pub(crate) const SWITCH_HOTKEY_ID: i32 = 1;
 pub(crate) const NEW_TAB_HOTKEY_ID: i32 = 2;
@@ -49,14 +49,16 @@ pub(crate) const DETACH_HOTKEY_ID: i32 = 5;
 pub(crate) const GROUP_HOTKEY_ID: i32 = 6;
 
 const GROUP_DIVIDER_LOGICAL: f64 = 8.0;
+const PANE_MIN_WIDTH_LOGICAL: f64 = 80.0;
 const GROUP_PALETTE: [u32; 6] = [
     0x00BB9AF7, 0x009ECE6A, 0x00E0AF68, 0x00F7768E, 0x0073DACA, 0x002AC3DE,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TabGroup {
     members: [usize; 2],
     color: u32,
+    weights: Vec<f64>,
 }
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_TAB_COUNT: usize = 2;
@@ -79,6 +81,22 @@ struct TabPress {
     guest_index: usize,
     x: i32,
     y: i32,
+}
+
+#[derive(Clone, Copy)]
+struct DividerDrag {
+    group_index: usize,
+    slot: usize,
+    grab_offset: i32,
+}
+
+#[derive(Clone, Copy)]
+struct DividerDragGeometry {
+    origin_x: i32,
+    left_x: i32,
+    left_width: i32,
+    pair: i32,
+    total: i32,
 }
 
 fn show_error_box(message: &str) {
@@ -162,14 +180,40 @@ fn index_remap_after_compact(total: usize, keep: impl Fn(usize) -> bool) -> Vec<
     new_index_of_old
 }
 
+fn normalize_weights(weights: &[f64]) -> Vec<f64> {
+    let count = weights.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let cleaned: Vec<f64> = weights
+        .iter()
+        .map(|weight| {
+            if weight.is_finite() {
+                weight.max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let sum: f64 = cleaned.iter().sum();
+
+    if !sum.is_finite() || sum <= 0.0 {
+        return vec![1.0 / count as f64; count];
+    }
+
+    cleaned.into_iter().map(|weight| weight / sum).collect()
+}
+
 fn pane_rects(
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     divider: i32,
-    count: usize,
+    weights: &[f64],
 ) -> Vec<WindowBounds> {
+    let count = weights.len();
     if count == 0 || width <= 0 || height <= 0 {
         return Vec::new();
     }
@@ -183,19 +227,60 @@ fn pane_rects(
         }];
     }
 
-    let pane_width = (width - divider * (count as i32 - 1)) / count as i32;
-    if pane_width <= 0 {
+    let total = width - divider * (count as i32 - 1);
+    if total <= 0 {
         return Vec::new();
     }
 
-    (0..count)
-        .map(|slot| WindowBounds {
-            x: x + slot as i32 * (pane_width + divider),
+    let mut boundaries = Vec::with_capacity(count + 1);
+    boundaries.push(0i32);
+    let mut consumed = 0.0;
+    for weight in &weights[..count - 1] {
+        consumed += weight.clamp(0.0, 1.0);
+        boundaries.push((consumed * total as f64).round() as i32);
+    }
+    boundaries.push(total);
+
+    let mut panes = Vec::with_capacity(count);
+    let mut pane_x = x;
+    for slot in 0..count {
+        let pane_width = boundaries[slot + 1] - boundaries[slot];
+        if pane_width <= 0 {
+            return Vec::new();
+        }
+
+        panes.push(WindowBounds {
+            x: pane_x,
             y,
             width: pane_width,
             height,
-        })
-        .collect()
+        });
+        pane_x += pane_width + divider;
+    }
+
+    panes
+}
+
+fn divider_drag_range(pair_width: i32, min_pane: i32) -> (i32, i32) {
+    let pair_width = pair_width.max(0);
+    let min_pane = min_pane.max(1);
+
+    if pair_width >= 2 * min_pane {
+        (min_pane, pair_width - min_pane)
+    } else {
+        let half = pair_width / 2;
+        (half, pair_width - half)
+    }
+}
+
+fn pane_width_after_drag(
+    pane_origin: i32,
+    pair_width: i32,
+    desired_boundary: i32,
+    min_pane: i32,
+) -> i32 {
+    let (low, high) = divider_drag_range(pair_width, min_pane);
+    (desired_boundary - pane_origin).clamp(low, high)
 }
 
 fn grouping_candidate(
@@ -235,6 +320,7 @@ fn remap_tab_groups(groups: &[TabGroup], new_index_of_old: &[usize]) -> Vec<TabG
             .then(|| TabGroup {
                 members: [mapped[0], mapped[1]],
                 color: group.color,
+                weights: group.weights.clone(),
             })
         })
         .collect()
@@ -276,6 +362,8 @@ pub(crate) struct App {
     cursor_pos: Option<(i32, i32)>,
     last_strip_click: Option<(Instant, i32, i32)>,
     tab_press: Option<TabPress>,
+    divider_drag: Option<DividerDrag>,
+    divider_hover: Option<usize>,
     dwm_border_focused: Option<bool>,
     last_housekeeping: Instant,
 }
@@ -328,6 +416,8 @@ impl App {
             cursor_pos: None,
             last_strip_click: None,
             tab_press: None,
+            divider_drag: None,
+            divider_hover: None,
             dwm_border_focused: None,
             last_housekeeping: Instant::now(),
         }
@@ -499,14 +589,15 @@ impl App {
 
         let frame = self.host_content_frame()?;
         let members = self.visible_members(active);
-        let divider = (GROUP_DIVIDER_LOGICAL * self.scale_factor()).round() as i32;
+        let divider = self.group_divider_px();
+        let weights = self.pane_weights(active, members.len());
         let panes = pane_rects(
             frame.x,
             frame.y,
             frame.width,
             frame.height,
             divider,
-            members.len(),
+            &weights,
         );
         if panes.len() != members.len() {
             return None;
@@ -515,30 +606,75 @@ impl App {
         Some(members.into_iter().zip(panes).collect())
     }
 
-    fn content_divider(&self) -> Option<ContentDivider> {
-        let active = self.active?;
+    fn group_divider_px(&self) -> i32 {
+        (GROUP_DIVIDER_LOGICAL * self.scale_factor()).round() as i32
+    }
+
+    fn pane_min_width_px(&self) -> i32 {
+        ((PANE_MIN_WIDTH_LOGICAL * self.scale_factor()).round() as i32).max(1)
+    }
+
+    fn pane_weights(&self, active: usize, count: usize) -> Vec<f64> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let stored = self
+            .group_of(active)
+            .and_then(|group_index| self.groups.get(group_index))
+            .filter(|group| group.weights.len() == count)
+            .map(|group| group.weights.clone());
+
+        match stored {
+            Some(weights) => normalize_weights(&weights),
+            None => vec![1.0 / count as f64; count],
+        }
+    }
+
+    fn content_dividers(&self) -> Vec<ContentDivider> {
+        let Some(active) = self.active else {
+            return Vec::new();
+        };
         if self.visible_members(active).len() < 2 {
-            return None;
+            return Vec::new();
         }
 
-        let rects = self.layout_rects()?;
+        let Some(rects) = self.layout_rects() else {
+            return Vec::new();
+        };
         if rects.len() < 2 {
-            return None;
+            return Vec::new();
         }
 
-        let window = self.window.as_ref()?;
-        let origin = window.inner_position().ok()?;
+        let Some(group_index) = self.group_of(active) else {
+            return Vec::new();
+        };
+        let Some(window) = self.window.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(origin) = window.inner_position() else {
+            return Vec::new();
+        };
 
-        let color = self.groups[self.group_of(active)?].color;
-        let gap_start = rects[0].1.x + rects[0].1.width;
-        let gap_end = rects[1].1.x;
+        let color = self.groups[group_index].color;
+        (0..rects.len() - 1)
+            .map(|slot| {
+                let gap_start = rects[slot].1.x + rects[slot].1.width;
+                let gap_end = rects[slot + 1].1.x;
+                let emphasized = self.divider_hover == Some(slot)
+                    || self
+                        .divider_drag
+                        .is_some_and(|drag| drag.group_index == group_index && drag.slot == slot);
 
-        Some(ContentDivider {
-            x: (gap_start + gap_end) / 2 - origin.x,
-            y: rects[0].1.y - origin.y,
-            height: rects[0].1.height,
-            color,
-        })
+                ContentDivider {
+                    x: (gap_start + gap_end) / 2 - origin.x,
+                    y: rects[slot].1.y - origin.y,
+                    height: rects[slot].1.height,
+                    color,
+                    emphasized,
+                }
+            })
+            .collect()
     }
 
     fn group_of(&self, index: usize) -> Option<usize> {
@@ -599,10 +735,13 @@ impl App {
                 return;
             };
 
+            let members = [active, other];
+            let weight = 1.0 / members.len() as f64;
             let color = self.next_group_color();
             self.groups.push(TabGroup {
-                members: [active, other],
+                members,
                 color,
+                weights: vec![weight; members.len()],
             });
             debug_log!("Grouped tab {} with tab {}", active + 1, other + 1);
         }
@@ -1363,10 +1502,10 @@ impl App {
             })
             .collect();
 
-        let divider = self.content_divider();
+        let dividers = self.content_dividers();
 
         if let (Some(window), Some(tab_bar)) = (&self.window, self.tab_bar.as_mut()) {
-            tab_bar.draw(window, &models, divider);
+            tab_bar.draw(window, &models, &dividers);
         }
     }
 
@@ -1408,7 +1547,7 @@ impl App {
             return;
         }
 
-        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+        if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) || self.divider_drag.is_some() {
             return;
         }
 
@@ -1417,6 +1556,13 @@ impl App {
         let Some((x, y)) = self.cursor_pos else {
             return;
         };
+
+        if button == MouseButton::Left
+            && let Some(slot) = self.divider_slot_at(x, y)
+        {
+            self.begin_divider_drag(slot, x);
+            return;
+        }
 
         let hit = self
             .tab_bar
@@ -1546,6 +1692,10 @@ impl App {
         if button != MouseButton::Left {
             return;
         }
+        if self.divider_drag.is_some() {
+            self.finish_divider_drag();
+            return;
+        }
         if !self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
             return;
         }
@@ -1576,6 +1726,217 @@ impl App {
             let _ = ReleaseCapture();
         }
         self.update_hover();
+    }
+
+    fn divider_slot_at(&self, x: i32, y: i32) -> Option<usize> {
+        let active = self.active?;
+        if self.visible_members(active).len() < 2 {
+            return None;
+        }
+
+        let rects = self.layout_rects()?;
+        if rects.len() < 2 {
+            return None;
+        }
+
+        let window = self.window.as_ref()?;
+        let Ok(origin) = window.inner_position() else {
+            return None;
+        };
+
+        for slot in 0..rects.len() - 1 {
+            let left = rects[slot].1;
+            let right = rects[slot + 1].1;
+            let gap_start = left.x + left.width - origin.x;
+            let gap_end = right.x - origin.x;
+            let top = left.y - origin.y;
+            let bottom = top + left.height;
+
+            if x >= gap_start && x < gap_end && y >= top && y < bottom {
+                return Some(slot);
+            }
+        }
+
+        None
+    }
+
+    fn divider_drag_geometry(&self, drag: DividerDrag) -> Option<DividerDragGeometry> {
+        let active = self.active?;
+        if self.group_of(active) != Some(drag.group_index) {
+            return None;
+        }
+
+        let count = self.visible_members(active).len();
+        if count < 2 || drag.slot + 1 >= count {
+            return None;
+        }
+
+        if self
+            .groups
+            .get(drag.group_index)
+            .is_none_or(|group| group.weights.len() != count)
+        {
+            return None;
+        }
+
+        let frame = self.host_content_frame()?;
+        let window = self.window.as_ref()?;
+        let origin = window.inner_position().ok()?;
+        let rects = self.layout_rects()?;
+        if drag.slot + 1 >= rects.len() {
+            return None;
+        }
+
+        let divider = self.group_divider_px();
+        let total = frame.width - divider * (count as i32 - 1);
+        if total <= 0 {
+            return None;
+        }
+
+        let left = rects[drag.slot].1;
+        let right = rects[drag.slot + 1].1;
+        if left.width <= 0 || right.width <= 0 {
+            return None;
+        }
+
+        Some(DividerDragGeometry {
+            origin_x: origin.x,
+            left_x: left.x,
+            left_width: left.width,
+            pair: left.width + right.width,
+            total,
+        })
+    }
+
+    fn begin_divider_drag(&mut self, slot: usize, cursor_x: i32) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let Some(group_index) = self.group_of(active) else {
+            return;
+        };
+
+        let probe = DividerDrag {
+            group_index,
+            slot,
+            grab_offset: 0,
+        };
+        let Some(geometry) = self.divider_drag_geometry(probe) else {
+            return;
+        };
+
+        let grab_offset = geometry.origin_x + cursor_x - (geometry.left_x + geometry.left_width);
+        self.divider_drag = Some(DividerDrag {
+            group_index,
+            slot,
+            grab_offset,
+        });
+
+        if let Some(hwnd) = self.host_hwnd() {
+            unsafe {
+                let _ = SetCapture(hwnd);
+            }
+        }
+        self.update_cursor_icon();
+        self.mark_dirty();
+        debug_log!("Resizing group panes from divider {slot} (grab offset {grab_offset})");
+    }
+
+    fn update_divider_drag(&mut self, cursor_x: i32) {
+        let Some(drag) = self.divider_drag else {
+            return;
+        };
+
+        let Some(geometry) = self.divider_drag_geometry(drag) else {
+            self.cancel_divider_drag();
+            return;
+        };
+
+        let desired_boundary = geometry.origin_x + cursor_x - drag.grab_offset;
+        let new_left_width = pane_width_after_drag(
+            geometry.left_x,
+            geometry.pair,
+            desired_boundary,
+            self.pane_min_width_px(),
+        );
+        if new_left_width == geometry.left_width {
+            return;
+        }
+
+        {
+            let weights = &mut self.groups[drag.group_index].weights;
+            weights[drag.slot] = new_left_width as f64 / geometry.total as f64;
+            weights[drag.slot + 1] =
+                geometry.pair as f64 / geometry.total as f64 - weights[drag.slot];
+        }
+
+        self.bounds_dirty = !self.position_visible_members();
+        self.mark_dirty();
+    }
+
+    fn finish_divider_drag(&mut self) {
+        let Some(drag) = self.divider_drag.take() else {
+            return;
+        };
+
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.update_cursor_icon();
+        self.mark_dirty();
+
+        let ratios = self
+            .groups
+            .get(drag.group_index)
+            .map(|group| {
+                group
+                    .weights
+                    .iter()
+                    .map(|weight| format!("{:.0}%", weight * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .unwrap_or_default();
+        debug_log!("Group panes resized to {ratios}");
+    }
+
+    fn cancel_divider_drag(&mut self) {
+        if self.divider_drag.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.update_cursor_icon();
+            self.mark_dirty();
+            debug_log!("Cancelled group pane resize");
+        }
+    }
+
+    fn update_divider_hover(&mut self, x: i32, y: i32) {
+        if self.divider_drag.is_some() {
+            return;
+        }
+
+        let slot = self.divider_slot_at(x, y);
+        if slot != self.divider_hover {
+            self.divider_hover = slot;
+            self.mark_dirty();
+            self.update_cursor_icon();
+        }
+    }
+
+    fn update_cursor_icon(&mut self) {
+        let Some(window) = self.window.as_deref() else {
+            return;
+        };
+
+        let over_divider = self.divider_drag.is_some() || self.divider_hover.is_some();
+        let icon = if over_divider {
+            CursorIcon::EwResize
+        } else {
+            CursorIcon::Default
+        };
+
+        window.set_cursor(Cursor::Icon(icon));
     }
 
     fn apply_tab_order(&mut self, display_order: Vec<usize>) {
@@ -2054,6 +2415,9 @@ impl ApplicationHandler for App {
                     {
                         self.cancel_tab_drag();
                     }
+                    if self.divider_drag.is_some() {
+                        self.cancel_divider_drag();
+                    }
                 }
                 self.update_hotkey_registration();
                 self.sync_tab_bar_focus();
@@ -2067,6 +2431,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.cancel_tab_drag();
+                self.cancel_divider_drag();
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.update_scale(scale_factor);
                 }
@@ -2099,7 +2464,9 @@ impl ApplicationHandler for App {
                 self.cursor_pos = Some((x, y));
                 self.promote_tab_press(x, y);
 
-                if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+                if self.divider_drag.is_some() {
+                    self.update_divider_drag(x);
+                } else if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
                     if let Some(tab_bar) = self.tab_bar.as_mut()
                         && tab_bar.update_drag(x)
                     {
@@ -2107,17 +2474,24 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     self.update_hover();
+                    self.update_divider_hover(x, y);
                 }
             }
 
             WindowEvent::CursorLeft { .. } => {
-                if self.tab_bar.as_ref().is_some_and(TabBar::is_dragging) {
+                if self.divider_drag.is_some()
+                    || self.tab_bar.as_ref().is_some_and(TabBar::is_dragging)
+                {
                     return;
                 }
 
                 self.cursor_pos = None;
                 if let Some(tab_bar) = self.tab_bar.as_mut() {
                     tab_bar.clear_hover();
+                }
+                if self.divider_hover.take().is_some() {
+                    self.mark_dirty();
+                    self.update_cursor_icon();
                 }
             }
 
@@ -2127,6 +2501,7 @@ impl ApplicationHandler for App {
                 };
                 if y >= self.tab_strip_height()
                     || self.tab_bar.as_ref().is_some_and(TabBar::is_dragging)
+                    || self.divider_drag.is_some()
                 {
                     return;
                 }
@@ -2172,6 +2547,9 @@ impl ApplicationHandler for App {
             .size_move_finished
             .swap(false, Ordering::AcqRel);
         let in_size_move = self.native_host_events.in_size_move.load(Ordering::Acquire);
+        if in_size_move && self.divider_drag.is_some() {
+            self.cancel_divider_drag();
+        }
         let lift_pending = self.native_host_events.has_lifted();
         let lift_released = if !in_size_move && (move_finished || lift_pending) {
             self.reconcile_move_lift()
@@ -2303,7 +2681,8 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        TabGroup, grouping_candidate, index_remap_after_compact, pane_rects, remap_tab_groups,
+        TabGroup, WindowBounds, divider_drag_range, grouping_candidate, index_remap_after_compact,
+        normalize_weights, pane_rects, pane_width_after_drag, remap_tab_groups,
         tab_sequence_for_order,
     };
 
@@ -2311,6 +2690,7 @@ mod tests {
         TabGroup {
             members,
             color: 0x007AA2F7,
+            weights: vec![0.5, 0.5],
         }
     }
 
@@ -2381,7 +2761,7 @@ mod tests {
 
     #[test]
     fn single_pane_spans_full_content() {
-        let panes = pane_rects(10, 20, 300, 200, 8, 1);
+        let panes = pane_rects(10, 20, 300, 200, 8, &[1.0]);
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].x, 10);
         assert_eq!(panes[0].width, 300);
@@ -2389,7 +2769,7 @@ mod tests {
 
     #[test]
     fn two_panes_split_with_divider_gap() {
-        let panes = pane_rects(0, 0, 408, 100, 8, 2);
+        let panes = pane_rects(0, 0, 408, 100, 8, &[0.5, 0.5]);
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].x, 0);
         assert_eq!(panes[0].width, 200);
@@ -2400,9 +2780,139 @@ mod tests {
 
     #[test]
     fn pane_split_is_empty_when_width_cannot_fit() {
-        assert!(pane_rects(0, 0, 4, 100, 8, 2).is_empty());
-        assert!(pane_rects(0, 0, 100, 0, 8, 1).is_empty());
-        assert!(pane_rects(0, 0, 100, 100, 8, 0).is_empty());
+        assert!(pane_rects(0, 0, 4, 100, 8, &[0.5, 0.5]).is_empty());
+        assert!(pane_rects(0, 0, 100, 0, 8, &[1.0]).is_empty());
+        assert!(pane_rects(0, 0, 100, 100, 8, &[]).is_empty());
+    }
+
+    #[test]
+    fn weighted_panes_follow_the_ratios() {
+        let panes = pane_rects(0, 0, 408, 100, 8, &[0.25, 0.75]);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(
+            panes[0],
+            WindowBounds {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100
+            }
+        );
+        assert_eq!(
+            panes[1],
+            WindowBounds {
+                x: 108,
+                y: 0,
+                width: 300,
+                height: 100
+            }
+        );
+    }
+
+    #[test]
+    fn weighted_panes_distribute_rounding_without_gaps() {
+        let panes = pane_rects(10, 5, 400, 50, 8, &[1.0 / 3.0, 2.0 / 3.0]);
+        assert_eq!(
+            panes[0],
+            WindowBounds {
+                x: 10,
+                y: 5,
+                width: 131,
+                height: 50
+            }
+        );
+        assert_eq!(
+            panes[1],
+            WindowBounds {
+                x: 149,
+                y: 5,
+                width: 261,
+                height: 50
+            }
+        );
+    }
+
+    #[test]
+    fn three_weighted_panes_split_across_two_dividers() {
+        let panes = pane_rects(0, 0, 424, 40, 8, &[0.5, 0.25, 0.25]);
+        assert_eq!(
+            panes[0],
+            WindowBounds {
+                x: 0,
+                y: 0,
+                width: 204,
+                height: 40
+            }
+        );
+        assert_eq!(
+            panes[1],
+            WindowBounds {
+                x: 212,
+                y: 0,
+                width: 102,
+                height: 40
+            }
+        );
+        assert_eq!(
+            panes[2],
+            WindowBounds {
+                x: 322,
+                y: 0,
+                width: 102,
+                height: 40
+            }
+        );
+    }
+
+    #[test]
+    fn degenerate_weights_produce_no_panes() {
+        assert!(pane_rects(0, 0, 100, 50, 8, &[1.0, 0.0]).is_empty());
+    }
+
+    #[test]
+    fn normalize_weights_cleans_and_sums_to_one() {
+        assert!(normalize_weights(&[]).is_empty());
+        assert_eq!(normalize_weights(&[0.0]), vec![1.0]);
+        assert_eq!(normalize_weights(&[0.0, 0.0]), vec![0.5, 0.5]);
+        assert_eq!(normalize_weights(&[-2.0, 6.0]), vec![0.0, 1.0]);
+        assert_eq!(normalize_weights(&[-1.0, 1.0, 3.0]), vec![0.0, 0.25, 0.75]);
+        assert_eq!(normalize_weights(&[1.0, 3.0]), vec![0.25, 0.75]);
+        assert_eq!(
+            normalize_weights(&[f64::NAN, 1.0, 1.0]),
+            vec![0.0, 0.5, 0.5]
+        );
+        assert_eq!(normalize_weights(&[f64::INFINITY, 2.0]), vec![0.0, 1.0]);
+        assert_eq!(
+            normalize_weights(&[f64::NEG_INFINITY, f64::NAN]),
+            vec![0.5, 0.5]
+        );
+    }
+
+    #[test]
+    fn divider_drag_range_respects_minimum_pane_width() {
+        assert_eq!(divider_drag_range(400, 120), (120, 280));
+        assert_eq!(divider_drag_range(401, 120), (120, 281));
+        assert_eq!(divider_drag_range(240, 120), (120, 120));
+    }
+
+    #[test]
+    fn divider_drag_range_stays_valid_for_tiny_pairs() {
+        assert_eq!(divider_drag_range(3, 120), (1, 2));
+        assert_eq!(divider_drag_range(2, 120), (1, 1));
+        assert_eq!(divider_drag_range(1, 120), (0, 1));
+        assert_eq!(divider_drag_range(0, 120), (0, 0));
+        assert_eq!(divider_drag_range(-5, 120), (0, 0));
+    }
+
+    #[test]
+    fn pane_width_after_drag_clamps_to_the_pair_bounds() {
+        assert_eq!(pane_width_after_drag(0, 400, 50, 120), 120);
+        assert_eq!(pane_width_after_drag(0, 400, 250, 120), 250);
+        assert_eq!(pane_width_after_drag(0, 400, 350, 120), 280);
+        assert_eq!(pane_width_after_drag(100, 400, 300, 120), 200);
+        assert_eq!(pane_width_after_drag(0, 400, -1000, 120), 120);
+        assert_eq!(pane_width_after_drag(0, 400, 10_000, 120), 280);
+        assert_eq!(pane_width_after_drag(0, 3, 0, 120), 1);
     }
 
     #[test]
@@ -2427,15 +2937,18 @@ mod tests {
 
     #[test]
     fn tab_groups_survive_index_remaps_and_dissolve_on_member_loss() {
-        let groups = vec![group([0, 2]), group([1, 3])];
+        let mut groups = vec![group([0, 2]), group([1, 3])];
+        groups[0].weights = vec![0.7, 0.3];
 
         let identity = remap_tab_groups(&groups, &[0, 1, 2, 3]);
         assert_eq!(identity.len(), 2);
         assert_eq!(identity[0].members, [0, 2]);
+        assert_eq!(identity[0].weights, vec![0.7, 0.3]);
 
         let after_removal = remap_tab_groups(&groups, &[0, usize::MAX, 1, 2]);
         assert_eq!(after_removal.len(), 1);
         assert_eq!(after_removal[0].members, [0, 1]);
+        assert_eq!(after_removal[0].weights, vec![0.7, 0.3]);
 
         let stale = vec![group([0, 9])];
         assert!(remap_tab_groups(&stale, &[0, 1]).is_empty());

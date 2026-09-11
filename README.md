@@ -25,7 +25,7 @@ Instead of relying on terminal-specific tab implementations or tiling window man
 - **Clean Alt+Tab / Taskbar integration**: Makes hosted guest windows owned by the container, so they group under Uvez and never appear as separate Taskbar or Alt+Tab entries.
 - **Software-rendered tab bar**: A minimal tab strip rendered via `softbuffer` and `fontdue` (Cascadia Code) that only redraws on state changes.
 - **MRU Tab Switching**: `Ctrl + Tab` toggles between your most recently used tabs first.
-- **Tab groups**: `Ctrl + Alt + G` combines two tabs into a color-coded group that displays them side by side, joined by a matching on-screen divider.
+- **Tab groups**: `Ctrl + Alt + G` combines two tabs into a color-coded group that displays them side by side, joined by a matching on-screen divider that you can drag to resize the panes.
 
 The guests are real, unmodified applications - `winfetch` inside a hosted tab reports `Terminal: alacritty`:
 
@@ -45,6 +45,7 @@ The guests are real, unmodified applications - `winfetch` inside a hosted tab re
 | **Detach tab** | `Left Click` on `↗` on a tab or `Ctrl + Alt + D` |
 | **Attach focused window** | `Ctrl + Alt + A` |
 | **Group / ungroup tabs** | `Ctrl + Alt + G` |
+| **Resize grouped panes** | `Drag` the divider between grouped tabs |
 | **Minimize / Maximize / Close** | Buttons in the top-right of the tab strip |
 | **Move window** | Drag the empty tab strip |
 | **Maximize / restore** | Double-click the empty tab strip |

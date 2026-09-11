@@ -53,6 +53,7 @@ pub(crate) struct ContentDivider {
     pub(crate) y: i32,
     pub(crate) height: i32,
     pub(crate) color: u32,
+    pub(crate) emphasized: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -482,12 +483,7 @@ impl TabBar {
         Hit::None
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        window: &Window,
-        tabs: &[TabModel],
-        divider: Option<ContentDivider>,
-    ) {
+    pub(crate) fn draw(&mut self, window: &Window, tabs: &[TabModel], dividers: &[ContentDivider]) {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
@@ -1241,18 +1237,24 @@ impl TabBar {
             }
         }
 
-        if let Some(divider) = divider {
+        for divider in dividers {
+            let width = if divider.emphasized { 5 } else { 3 };
+            let color = if divider.emphasized {
+                blend_pixel(divider.color, COLOR_WHITE, 96)
+            } else {
+                divider.color
+            };
             Self::fill_rect(
                 pixels,
                 stride,
                 canvas_height,
                 Rect {
-                    x: divider.x - 1,
+                    x: divider.x - width / 2,
                     y: divider.y,
-                    w: 3,
+                    w: width,
                     h: divider.height,
                 },
-                divider.color,
+                color,
             );
         }
 
